@@ -9,9 +9,13 @@ from alembic import context
 from hookline.config import get_settings
 from hookline.db.base import Base
 
-# Imported for the side effect only: importing the module registers the table on
-# Base.metadata. Without it autogenerate sees no tables and emits an empty migration.
+# Imported for the side effect only: importing a model module registers its table on
+# Base.metadata. Without the import, autogenerate sees no table and emits an empty
+# migration with no error. Every new model needs a line here.
+from hookline.models.delivery import Delivery  # noqa: F401
+from hookline.models.delivery_attempt import DeliveryAttempt  # noqa: F401
 from hookline.models.endpoint import Endpoint  # noqa: F401
+from hookline.models.event import Event  # noqa: F401
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.

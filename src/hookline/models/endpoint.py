@@ -1,7 +1,7 @@
 from datetime import datetime
 from uuid import UUID, uuid4
 
-from sqlalchemy import Boolean, DateTime, String, func, text
+from sqlalchemy import Boolean, DateTime, Index, String, func, text
 from sqlalchemy.dialects.postgresql import ARRAY
 
 # N811 wants a constant-cased alias; PgUUID reads better and disambiguates from uuid.UUID.
@@ -24,4 +24,12 @@ class Endpoint(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        # Every ingested event runs `event_types @> ARRAY['<type>']` to find its
+        # subscribers, so this is the hottest query in the system - once per event, not
+        # once per request. GIN is the index type that can answer array containment;
+        # a default B-tree cannot and would leave it a sequential scan.
+        Index("ix_endpoints_event_types", "event_types", postgresql_using="gin"),
     )

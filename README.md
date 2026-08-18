@@ -7,7 +7,9 @@ and a permanent audit trail of every attempt.
 A smaller, readable implementation of what [Svix](https://svix.com) and
 [Hookdeck](https://hookdeck.com) sell as a product.
 
-> **Status:** in active development. Phase 2 of 10 complete — see [Roadmap](#roadmap).
+> **Status:** in active development. Phase 3 of 10 complete — events are accepted, deduplicated,
+> and fanned out to subscribers. The worker that actually delivers them is Phase 4.
+> See [Roadmap](#roadmap).
 
 ---
 
@@ -142,13 +144,60 @@ If port 5432 is already taken by a local Postgres install, change the mapping in
 | `GET` | `/api/v1/endpoints` | List destinations. Secrets omitted. |
 | `GET` | `/api/v1/endpoints/{id}` | Fetch one destination. Secret omitted. |
 | `DELETE` | `/api/v1/endpoints/{id}` | Remove a destination. |
+| `POST` | `/api/v1/events` | Ingest an event. Returns `202` and fans out to subscribers. |
+| `GET` | `/api/v1/events` | List recent events, newest first. `limit` / `offset`. |
+| `GET` | `/api/v1/events/{id}` | Fetch one event with its payload. |
+| `GET` | `/api/v1/events/{id}/deliveries` | Per-destination status for one event. |
+| `GET` | `/api/v1/deliveries/{id}` | One delivery's status, attempt count, next retry time. |
+| `GET` | `/api/v1/deliveries/{id}/attempts` | Every HTTP attempt made, with responses. |
 
 `/health` and `/ready` are separate on purpose. Kubernetes treats them very differently: a
 failing liveness probe restarts the pod, a failing readiness probe just pulls it out of the load
 balancer. If liveness checked the database, a brief Postgres blip would restart every pod in the
 deployment at once — turning a recoverable outage into a much worse one.
 
-Events, delivery attempts, and replay endpoints arrive in Phases 3–4.
+### Ingesting an event
+
+```bash
+curl -X POST localhost:8000/api/v1/events \
+  -H 'content-type: application/json' \
+  -H 'Idempotency-Key: order-1001-created' \
+  -d '{"event_type": "order.created", "payload": {"order_id": 1001, "total": 4500}}'
+```
+
+```json
+{
+  "id": "5d2c...",
+  "event_type": "order.created",
+  "created_at": "2026-08-18T11:25:43Z",
+  "deliveries_scheduled": 2,
+  "duplicate": false
+}
+```
+
+`deliveries_scheduled` is how many registered endpoints subscribe to this event type. **Zero is
+a successful ingest, not an error** — the event is stored and nobody is listening. It is
+surfaced in the response precisely so a misconfigured integration doesn't fail silently.
+
+`Idempotency-Key` is optional and highly recommended. Replaying a request with the same key
+returns the original event and schedules nothing new; the response carries
+`Idempotent-Replay: true` so a caller can tell the two apart without diffing bodies. This is
+enforced with `INSERT ... ON CONFLICT DO NOTHING`, so it holds under concurrency — twenty
+simultaneous requests with one key produce one event and one set of deliveries.
+
+Events, deliveries, and attempts are three separate tables on purpose:
+
+| Table | One row is | Why it's separate |
+|---|---|---|
+| `events` | what you ingested | store the payload once, not once per destination |
+| `deliveries` | one (event × endpoint) pair | **the outbox row a worker claims** — retry state is per destination |
+| `delivery_attempts` | one HTTP request | the audit trail: what was sent, what came back, when |
+
+If retry state lived on the event, one endpoint succeeding and another failing would have
+nowhere to go. Splitting it is what makes per-destination backoff and a dead letter queue
+possible.
+
+Deliveries currently stay `pending` — Phase 4 adds the worker that claims and delivers them.
 
 ---
 
@@ -181,12 +230,14 @@ hookline/
 └── src/hookline/
     ├── main.py                  # app factory + lifespan
     ├── config.py                # pydantic-settings
+    ├── enums.py                 # domain vocabulary shared by models and schemas
     ├── db/
     │   ├── base.py              # DeclarativeBase + constraint naming convention
     │   └── session.py           # engine, sessionmaker, per-request session
     ├── models/                  # SQLAlchemy ORM tables
     ├── schemas/                 # Pydantic wire models
-    ├── repositories/            # data access
+    ├── repositories/            # data access, one table each
+    ├── services/                # business logic spanning several repositories
     └── api/
         ├── deps.py              # Annotated dependency aliases
         ├── health.py            # liveness / readiness
@@ -202,9 +253,11 @@ Each layer knows the layer below it and never the one above.
 | Layer | Responsibility | Must not know about |
 |---|---|---|
 | `config.py` | environment → validated settings | HTTP |
+| `enums.py` | shared domain vocabulary | everything — it imports nothing |
 | `schemas/` | wire format in and out | storage |
 | `models/` | table definitions | HTTP |
-| `repositories/` | data access | HTTP, transaction boundaries |
+| `repositories/` | data access, one table each | HTTP, transaction boundaries, business rules |
+| `services/` | business logic across repositories | HTTP, transaction boundaries |
 | `api/deps.py` | dependency wiring | business logic |
 | `api/v1/routes/` | HTTP concerns | how storage works |
 
@@ -223,6 +276,13 @@ remembering to delete a key. Stripe and Svix use the same pattern.
 The commit happens in the request-scoped session dependency, so one request is one transaction.
 A handler that writes three rows and then raises rolls back all three, and the repository
 doesn't need to know that.
+
+**Services exist for logic that spans repositories.** Ingesting an event writes to `events`,
+queries `endpoints`, and writes to `deliveries`. That doesn't belong in a route handler, which
+should only translate HTTP, nor in a repository, which should own one table and know nothing
+about business rules. `EventIngestService` sits between them — and because it doesn't commit
+either, the event and all of its delivery rows land in a single transaction. A fan-out that
+fails halfway leaves nothing behind for a worker to find.
 
 ---
 
@@ -259,6 +319,16 @@ infer a backfill. Read every migration before applying it.
 100-character limit on any wide table. The `ruff` line above is part of the workflow, not
 optional cleanup.
 
+After applying a migration, run autogenerate once more. It should detect nothing. Anything it
+reports is drift between the models and the database, and finding it now is much cheaper than
+finding it inside an unrelated migration three weeks later.
+
+One drift source worth knowing about: `sa.Enum(..., create_constraint=True)` attaches its CHECK
+constraint to the *type* rather than to the table's metadata, where autogenerate cannot see it.
+It then finds the constraint in the database, finds no match in the models, and emits a
+`drop_constraint` on every future migration — quietly deleting your validation. `deliveries`
+therefore uses `create_constraint=False` plus an explicit `CheckConstraint` in `__table_args__`.
+
 ---
 
 ## Roadmap
@@ -268,8 +338,8 @@ optional cleanup.
 | 0 | uv, Python 3.13, Postgres via Docker Compose, scaffold | ✅ done |
 | 1 | FastAPI core — routers, Pydantic v2, DI, settings, in-memory store | ✅ done |
 | 2 | Postgres, SQLAlchemy 2.0 async, Alembic, repository pattern | ✅ done |
-| 3 | Events ingest, idempotency keys, delivery attempts table | next |
-| 4 | **Delivery worker** — transactional outbox, `SKIP LOCKED`, backoff + jitter, circuit breaker, HMAC signing, DLQ + replay | |
+| 3 | Events ingest, idempotency keys, fan-out, delivery + attempt tables | ✅ done |
+| 4 | **Delivery worker** — transactional outbox, `SKIP LOCKED`, backoff + jitter, circuit breaker, HMAC signing, DLQ + replay | next |
 | 5 | Redis — token bucket rate limiting, idempotency store, caching | |
 | 6 | Auth — hashed API keys, scopes, incoming signature verification | |
 | 7 | Observability — structlog JSON logs, Prometheus, OpenTelemetry, probes | |
