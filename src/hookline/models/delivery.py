@@ -58,7 +58,17 @@ class Delivery(Base):
     status: Mapped[DeliveryStatus] = mapped_column(
         DELIVERY_STATUS, nullable=False, server_default=DeliveryStatus.PENDING.value
     )
+    # Actual HTTP requests made. Incremented when an attempt is recorded, not when the
+    # row is claimed, so a worker that crashes before sending anything does not burn
+    # part of the budget.
     attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+
+    # Budget for this row specifically, snapshotted from settings at fan-out. Held per
+    # delivery rather than read from config at retry time so that changing the setting
+    # cannot retroactively dead-letter deliveries already in flight - and so replay can
+    # grant a fresh allowance by raising it, keeping attempt_number monotonic and the
+    # (delivery_id, attempt_number) unique constraint intact.
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("5"))
 
     # When this row next becomes claimable. Set to now() on creation so the first
     # attempt happens immediately; pushed forward by the backoff schedule after a failure.

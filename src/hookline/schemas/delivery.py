@@ -14,6 +14,9 @@ class DeliveryRead(BaseModel):
     endpoint_id: UUID
     status: DeliveryStatus
     attempt_count: int
+    # Exposed alongside attempt_count so a caller can render "3 of 5" without having to
+    # know the server's configuration - and because replay changes it per delivery.
+    max_attempts: int
     next_attempt_at: datetime
     last_error: str | None
     created_at: datetime

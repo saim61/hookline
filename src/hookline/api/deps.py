@@ -39,8 +39,14 @@ async def get_event_ingest_service(
     events: EventRepoDep,
     endpoints: EndpointRepoDep,
     deliveries: DeliveryRepoDep,
+    settings: SettingsDep,
 ) -> EventIngestService:
-    return EventIngestService(events=events, endpoints=endpoints, deliveries=deliveries)
+    return EventIngestService(
+        events=events,
+        endpoints=endpoints,
+        deliveries=deliveries,
+        max_delivery_attempts=settings.max_delivery_attempts,
+    )
 
 
 EventIngestDep = Annotated[EventIngestService, Depends(get_event_ingest_service)]

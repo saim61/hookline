@@ -1,7 +1,7 @@
 [project]
 name = "hookline"
 version = "0.1.0"
-description = "Add your description here"
+description = "Reliable webhook delivery with retries, backoff, HMAC signing and a dead letter queue"
 readme = "README.md"
 authors = [
     { name = "Saeem Mehmood", email = "saimmahmood61@gmail.com" }
@@ -11,9 +11,15 @@ dependencies = [
     "alembic>=1.19.1",
     "asyncpg>=0.31.0",
     "fastapi[standard]>=0.141.1",
+    "httpx>=0.28.1",
     "pydantic-settings>=2.15.0",
     "sqlalchemy>=2.0.52",
 ]
+
+# The worker is its own process, so it gets its own console script. `uv sync` puts
+# hookline-worker on PATH inside the venv the same way `go install` produces a binary.
+[project.scripts]
+hookline-worker = "hookline.worker.__main__:main"
 
 [build-system]
 requires = ["uv_build>=0.12.5,<0.13.0"]

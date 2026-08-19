@@ -7,9 +7,10 @@ and a permanent audit trail of every attempt.
 A smaller, readable implementation of what [Svix](https://svix.com) and
 [Hookdeck](https://hookdeck.com) sell as a product.
 
-> **Status:** in active development. Phase 3 of 10 complete — events are accepted, deduplicated,
-> and fanned out to subscribers. The worker that actually delivers them is Phase 4.
-> See [Roadmap](#roadmap).
+> **Status:** in active development. Phase 4 of 10 complete — **the core is working end to
+> end.** Events are accepted, deduplicated, fanned out, signed, delivered with retries and
+> backoff, and dead-lettered when an endpoint stays down. What follows is hardening: rate
+> limiting, auth, observability, tests, a dashboard, and deployment. See [Roadmap](#roadmap).
 
 ---
 
@@ -117,8 +118,18 @@ cp .env.example .env          # defaults work as-is for local dev
 uv sync                       # install dependencies from uv.lock
 docker compose up -d          # start postgres, wait for healthy
 uv run alembic upgrade head   # apply migrations
-uv run fastapi dev src/hookline/main.py
 ```
+
+Then run the two processes, in separate terminals:
+
+```bash
+uv run fastapi dev src/hookline/main.py   # the API
+uv run hookline-worker                    # the delivery worker
+```
+
+The API accepts and stores events; the worker delivers them. **Without the worker running,
+events are ingested and queued but never sent** — deliveries just sit in `pending`, which is
+the correct behaviour and also the first thing to check when a webhook doesn't arrive.
 
 Open <http://127.0.0.1:8000/docs> for the interactive API docs.
 
@@ -148,8 +159,10 @@ If port 5432 is already taken by a local Postgres install, change the mapping in
 | `GET` | `/api/v1/events` | List recent events, newest first. `limit` / `offset`. |
 | `GET` | `/api/v1/events/{id}` | Fetch one event with its payload. |
 | `GET` | `/api/v1/events/{id}/deliveries` | Per-destination status for one event. |
+| `GET` | `/api/v1/deliveries` | Deliveries by `status`. Defaults to `dead` — the DLQ. |
 | `GET` | `/api/v1/deliveries/{id}` | One delivery's status, attempt count, next retry time. |
 | `GET` | `/api/v1/deliveries/{id}/attempts` | Every HTTP attempt made, with responses. |
+| `POST` | `/api/v1/deliveries/{id}/replay` | Requeue a dead delivery with a fresh budget. |
 
 `/health` and `/ready` are separate on purpose. Kubernetes treats them very differently: a
 failing liveness probe restarts the pod, a failing readiness probe just pulls it out of the load
@@ -197,7 +210,169 @@ If retry state lived on the event, one endpoint succeeding and another failing w
 nowhere to go. Splitting it is what makes per-destination backoff and a dead letter queue
 possible.
 
-Deliveries currently stay `pending` — Phase 4 adds the worker that claims and delivers them.
+### The delivery worker
+
+The worker is a **separate process** from the API:
+
+```bash
+uv run hookline-worker
+```
+
+They scale on unrelated signals — the API on request rate, the worker on how slow customer
+endpoints happen to be — and a worker blocked on a dozen ten-second timeouts must not be able
+to add latency to an ingest call. In Kubernetes they are two Deployments with independent
+replica counts. Run as many workers as you like; they coordinate through Postgres alone.
+
+Each loop iteration is **claim → deliver → record**, and those three steps deliberately do not
+share a transaction:
+
+```sql
+SELECT id FROM deliveries
+ WHERE status = 'pending' AND next_attempt_at <= now()
+ ORDER BY next_attempt_at
+ LIMIT :batch
+   FOR UPDATE SKIP LOCKED       -- the whole trick
+```
+
+`SKIP LOCKED` is what makes this a work queue instead of a contention point. With a plain
+`FOR UPDATE`, worker B blocks until worker A commits, so N workers deliver at the throughput of
+one. `SKIP LOCKED` tells Postgres to step over rows another transaction is holding and take the
+next free ones, so every worker gets a disjoint batch — no Redis, no lock service, no leader
+election.
+
+Claiming also flips the rows to `in_flight` and commits immediately. After that they no longer
+match `status = 'pending'`, so nobody re-claims them even though the lock is gone while the slow
+part runs. Holding a row lock across a ten-second POST is the classic mistake here.
+
+The price of that split is a crash window: a worker killed between claiming and recording leaves
+rows `in_flight` that nobody owns. A **reaper** returns anything `in_flight` past
+`HOOKLINE_STALE_DELIVERY_TIMEOUT_SECONDS` to `pending`. Without it those rows are invisible
+forever — never retried, never dead-lettered — which is the failure mode that quietly turns
+"at least once" into "sometimes never".
+
+So the guarantee is **at-least-once, not exactly-once**. A delivery whose response is lost in
+transit gets sent again. Receivers deduplicate on the `webhook-id` header, which is the delivery
+id and is stable across every retry of that delivery.
+
+### Retry, backoff and the circuit breaker
+
+| Response | What happens |
+|---|---|
+| `2xx` | `delivered`, terminal |
+| `5xx`, timeout, DNS failure, connection refused | retry with backoff |
+| `408`, `425`, `429` | retry with backoff |
+| any other `4xx` | `dead` immediately, no retries |
+
+Other `4xx` codes say the request itself is wrong — bad path, rejected payload, bad auth — and
+sending identical bytes again cannot change the answer. Retrying five times only delays the dead
+letter by an hour while burning the receiver's error budget.
+
+Backoff is exponential with **equal jitter**: the delay after failure N is a random value in
+`[exp/2, exp]` where `exp = base * 2^(N-1)`, capped. Roughly 5–10s, 10–20s, 20–40s, 40–80s,
+80–160s with the default base of 10.
+
+The jitter is not decoration. Without it, an endpoint that goes down takes all of its pending
+deliveries with it and stamps them with the *same* retry time. When it comes back up they all
+arrive in the same instant and knock it over again — exactly the stampede the backoff was meant
+to prevent.
+
+Backoff alone still isn't enough. If an endpoint has been dead a day and a thousand events are
+queued for it, the worker burns a slot and a full timeout on every one, starving endpoints that
+are actually healthy. So there's a per-endpoint **circuit breaker**:
+
+```
+closed ──5 consecutive failures──► open ──cooldown elapsed──► half_open
+  ▲                                                              │
+  └──────────────── probe succeeds ◄──── one probe request ───────┘
+                                              │ probe fails
+                                              ▼
+                                        open (fresh cooldown)
+```
+
+While open, deliveries for that endpoint are rescheduled **without a request being made and
+without consuming an attempt** — the endpoint is known to be down, so charging the delivery for
+it would be unfair. The half-open probe is the part that matters: it answers "are they back?"
+at the cost of exactly one request, instead of either releasing the whole backlog on a timer or
+never noticing recovery at all.
+
+The breaker is in-memory, so it is per worker process: three workers hold three independent
+views and an endpoint may take up to 3× the threshold in failures before all of them trip.
+Nothing is lost — deliveries are still retried — the protection is just weaker than it looks.
+Phase 5 moves it into Redis so workers share one view.
+
+### Dead letter queue and replay
+
+```bash
+curl 'localhost:8000/api/v1/deliveries?status=dead'          # the DLQ
+curl -X POST localhost:8000/api/v1/deliveries/<id>/replay    # try again
+```
+
+Replay raises `max_attempts` rather than zeroing `attempt_count`, so attempt numbers keep
+increasing and the replayed attempts **append** to the audit trail instead of colliding with the
+numbers already there. The record of why a delivery died stays readable next to what happened
+when it was retried.
+
+Only `dead` deliveries can be replayed. Replaying a `pending` one would hand it to a second
+worker and replaying a `delivered` one would send the customer a duplicate, so both are refused
+with `409` rather than silently doing nothing.
+
+### Verifying a signature (receiver side)
+
+Every request carries three headers:
+
+```
+webhook-id:         <delivery id, stable across retries>
+webhook-timestamp:  <unix seconds>
+webhook-signature:  v1,<base64 hmac-sha256>
+```
+
+The signed string is `{webhook-id}.{webhook-timestamp}.{raw body}`, keyed on the signing secret
+with the `whsec_` prefix stripped. The body is the exact bytes on the wire — never re-serialise
+the JSON before verifying, or key ordering will change the digest.
+
+```python
+import base64, hashlib, hmac, time
+
+
+def verify(secret, headers, raw_body, tolerance=300):
+    ts = int(headers["webhook-timestamp"])
+    if abs(time.time() - ts) > tolerance:  # replay protection
+        return False
+    signed = f"{headers['webhook-id']}.{ts}.".encode() + raw_body
+    key = secret.removeprefix("whsec_").encode()
+    expected = "v1," + base64.b64encode(hmac.new(key, signed, hashlib.sha256).digest()).decode()
+    # constant-time, and any one of the space-separated signatures may match
+    return any(
+        hmac.compare_digest(expected, got) for got in headers["webhook-signature"].split(" ")
+    )
+```
+
+Two details that are easy to get wrong and matter:
+
+**Check the timestamp.** Signing the body alone means a captured request stays valid forever —
+anyone who records one can replay it indefinitely. Including the timestamp in the signed string
+is what makes a stale request detectable.
+
+**Use `compare_digest`, not `==`.** String equality returns as soon as it finds a differing
+byte, so how long the comparison takes reveals how much of the prefix was right. That is enough
+to walk a forged signature out one byte at a time.
+
+The `v1,` prefix and the space-separated list exist for rotation: during a change a request can
+carry both the old and new signature, and a receiver accepting either sees no downtime.
+
+### Request envelope
+
+```json
+{
+  "id": "<event id>",
+  "type": "order.created",
+  "created_at": "2026-08-18T11:25:43+00:00",
+  "data": { "order_id": 1001, "total": 4500 }
+}
+```
+
+Redirects are **not** followed. A customer endpoint returning a 302 is nearly always a
+misconfiguration, and following it would send a body signed for one host to a different one.
 
 ---
 
@@ -211,8 +386,27 @@ file. Defaults are in [`src/hookline/config.py`](src/hookline/config.py).
 | `HOOKLINE_APP_NAME` | `hookline` | Service name, used in logs |
 | `HOOKLINE_DEBUG` | `false` | Echo SQL to stdout |
 | `HOOKLINE_DATABASE_URL` | `postgresql+asyncpg://hookline:hookline@localhost:5432/hookline` | Postgres DSN — note the `+asyncpg` driver |
-| `HOOKLINE_MAX_DELIVERY_ATTEMPTS` | `5` | Attempts before an event is dead-lettered |
+| `HOOKLINE_MAX_DELIVERY_ATTEMPTS` | `5` | Attempts before a delivery is dead-lettered |
 | `HOOKLINE_DELIVERY_TIMEOUT_SECONDS` | `10.0` | Per-request timeout when delivering |
+| `HOOKLINE_WORKER_POLL_INTERVAL_SECONDS` | `1.0` | Sleep when a poll finds nothing due |
+| `HOOKLINE_WORKER_BATCH_SIZE` | `20` | Deliveries claimed per poll |
+| `HOOKLINE_STALE_DELIVERY_TIMEOUT_SECONDS` | `300.0` | When an `in_flight` row is treated as abandoned |
+| `HOOKLINE_RETRY_BASE_DELAY_SECONDS` | `10.0` | First retry window |
+| `HOOKLINE_RETRY_MAX_DELAY_SECONDS` | `3600.0` | Backoff cap |
+| `HOOKLINE_CIRCUIT_BREAKER_FAILURE_THRESHOLD` | `5` | Consecutive failures before an endpoint's circuit opens |
+| `HOOKLINE_CIRCUIT_BREAKER_COOLDOWN_SECONDS` | `60.0` | How long it stays open before a probe |
+
+`MAX_DELIVERY_ATTEMPTS` is snapshotted onto each delivery at fan-out rather than read at retry
+time, so lowering it cannot retroactively dead-letter work already queued.
+
+`STALE_DELIVERY_TIMEOUT_SECONDS` must comfortably exceed `DELIVERY_TIMEOUT_SECONDS`. Set it
+lower and the reaper will reclaim rows a healthy worker is still working on, and the customer
+gets the webhook twice.
+
+Setting `CIRCUIT_BREAKER_FAILURE_THRESHOLD` below `MAX_DELIVERY_ATTEMPTS` is legal but changes
+the behaviour for a dead endpoint: the circuit opens before any single delivery exhausts its
+budget, so deliveries are skipped (costing no attempt) rather than failing, and they reach the
+DLQ over many cooldown cycles instead of promptly. Nothing is lost, but the DLQ fills slowly.
 
 ---
 
@@ -238,6 +432,14 @@ hookline/
     ├── schemas/                 # Pydantic wire models
     ├── repositories/            # data access, one table each
     ├── services/                # business logic spanning several repositories
+    ├── delivery/                # pure delivery logic, no database
+    │   ├── signing.py           # HMAC sign + verify
+    │   ├── backoff.py           # exponential + jitter
+    │   ├── breaker.py           # per-endpoint circuit breaker
+    │   └── client.py            # the signed POST, and what counts as retryable
+    ├── worker/
+    │   ├── runner.py            # claim -> deliver -> record loop
+    │   └── __main__.py          # `hookline-worker` entrypoint, signal handling
     └── api/
         ├── deps.py              # Annotated dependency aliases
         ├── health.py            # liveness / readiness
@@ -245,6 +447,11 @@ hookline/
             ├── router.py
             └── routes/          # HTTP handlers
 ```
+
+`delivery/` holds no I/O beyond the one HTTP call and touches no database. Backoff is a pure
+function, the breaker takes an injectable clock, and signing is `bytes in, string out` — so all
+three can be tested exhaustively without Postgres, a network, or waiting for real time to pass.
+`worker/` is the part that has to deal with both.
 
 ### Layer discipline
 
@@ -289,10 +496,18 @@ fails halfway leaves nothing behind for a worker to find.
 ## Development
 
 ```bash
-uv run fastapi dev src/hookline/main.py    # dev server with reload
+uv run fastapi dev src/hookline/main.py    # api, with reload
+uv run hookline-worker                     # delivery worker
 uv run ruff check --fix . && uv run ruff format .
 uv run mypy src                            # strict mode, must stay clean
 docker compose ps                          # db should report "healthy"
+```
+
+Handy while poking at the worker — turn a normally hour-long retry schedule into seconds:
+
+```bash
+HOOKLINE_RETRY_BASE_DELAY_SECONDS=1 HOOKLINE_WORKER_POLL_INTERVAL_SECONDS=0.2 \
+  uv run hookline-worker
 ```
 
 ### Migrations
@@ -339,15 +554,25 @@ therefore uses `create_constraint=False` plus an explicit `CheckConstraint` in `
 | 1 | FastAPI core — routers, Pydantic v2, DI, settings, in-memory store | ✅ done |
 | 2 | Postgres, SQLAlchemy 2.0 async, Alembic, repository pattern | ✅ done |
 | 3 | Events ingest, idempotency keys, fan-out, delivery + attempt tables | ✅ done |
-| 4 | **Delivery worker** — transactional outbox, `SKIP LOCKED`, backoff + jitter, circuit breaker, HMAC signing, DLQ + replay | next |
-| 5 | Redis — token bucket rate limiting, idempotency store, caching | |
+| 4 | **Delivery worker** — transactional outbox, `SKIP LOCKED`, backoff + jitter, circuit breaker, HMAC signing, DLQ + replay | ✅ done |
+| 5 | Redis — token bucket rate limiting, shared circuit breaker state, caching | next |
 | 6 | Auth — hashed API keys, scopes, incoming signature verification | |
 | 7 | Observability — structlog JSON logs, Prometheus, OpenTelemetry, probes | |
 | 8 | Testing — pytest, pytest-asyncio, testcontainers, k6 load test | |
 | 9 | Dashboard — HTMX + Jinja2, event log with a retry button | |
 | 10 | Ship — multi-stage Dockerfile, Helm chart, Minikube, GitHub Actions | |
 
-Phase 4 is the substance of the project. Phases 1–3 are the groundwork that makes it possible.
+Phase 4 was the substance of the project; phases 1–3 were the groundwork that made it possible.
+Everything after it is hardening rather than new capability.
+
+Known gaps, deliberately deferred:
+
+- **No authentication.** Every endpoint is open. Phase 6.
+- **No rate limiting.** A caller can ingest as fast as Postgres accepts writes. Phase 5.
+- **The circuit breaker is per worker process,** not shared. Phase 5 moves it to Redis.
+- **No automated test suite yet.** Each phase has been verified against a live server and
+  Postgres with a scripted acceptance run, but those scripts are not committed and do not run
+  in CI. Phase 8.
 
 ---
 

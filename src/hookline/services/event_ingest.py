@@ -31,10 +31,12 @@ class EventIngestService:
         events: EventRepository,
         endpoints: EndpointRepository,
         deliveries: DeliveryRepository,
+        max_delivery_attempts: int,
     ) -> None:
         self._events = events
         self._endpoints = endpoints
         self._deliveries = deliveries
+        self._max_delivery_attempts = max_delivery_attempts
 
     async def ingest(
         self,
@@ -58,6 +60,9 @@ class EventIngestService:
         scheduled = await self._deliveries.create_many(
             event_id=event.id,
             endpoint_ids=[endpoint.id for endpoint in subscribers],
+            # Snapshotted now so a later config change cannot retroactively shorten the
+            # budget of deliveries already queued.
+            max_attempts=self._max_delivery_attempts,
         )
         return IngestResult(
             event=event,
