@@ -1,4 +1,5 @@
 from functools import lru_cache
+from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -43,6 +44,35 @@ class Settings(BaseSettings):
     circuit_breaker_failure_threshold: int = Field(default=5, ge=1)
     # How long the circuit stays open before one probe request is allowed through.
     circuit_breaker_cooldown_seconds: float = Field(default=60.0, gt=0)
+    # "redis" shares breaker state across every worker; "memory" keeps it per process,
+    # which needs no Redis but lets each worker learn the same endpoint is down
+    # independently.
+    circuit_breaker_backend: Literal["redis", "memory"] = "redis"
+
+    # --- redis ------------------------------------------------------------------
+    redis_url: str = "redis://localhost:6379/0"
+
+    # --- rate limiting ----------------------------------------------------------
+    rate_limit_enabled: bool = True
+    # Token bucket: `capacity` requests may arrive at once, refilling at
+    # `refill_per_second`. Capacity is the burst allowance, refill is the sustained
+    # rate - the two together are what let a caller send a spike of 100 and still be
+    # held to 20/s on average.
+    rate_limit_capacity: int = Field(default=100, ge=1)
+    rate_limit_refill_per_second: float = Field(default=20.0, gt=0)
+
+    # Outbound, per destination endpoint, shared across every worker. The inbound limit
+    # protects Hookline; this one protects the customer's server, which is the side that
+    # did not sign up for whatever traffic spike just happened.
+    delivery_rate_limit_enabled: bool = True
+    delivery_rate_limit_capacity: int = Field(default=20, ge=1)
+    delivery_rate_limit_per_second: float = Field(default=10.0, gt=0)
+
+    # --- caching ----------------------------------------------------------------
+    # Subscriber lookups are invalidated explicitly whenever an endpoint changes, so
+    # this TTL only bounds how long a stale entry can survive a missed invalidation
+    # (a crash between the write and the delete). Short enough to self-heal.
+    subscriber_cache_ttl_seconds: int = Field(default=30, ge=1)
 
 
 @lru_cache

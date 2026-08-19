@@ -8,9 +8,11 @@ from uuid import UUID
 import httpx
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from hookline.cache.client import get_redis
+from hookline.cache.ratelimit import TokenBucketLimiter
 from hookline.config import Settings
 from hookline.delivery.backoff import next_delay_seconds
-from hookline.delivery.breaker import CircuitBreaker
+from hookline.delivery.breaker import Breaker, InMemoryCircuitBreaker, RedisCircuitBreaker
 from hookline.delivery.client import DeliveryClient, build_body
 from hookline.repositories.delivery import DeliveryJob, DeliveryRepository
 
@@ -24,6 +26,7 @@ class BatchStats:
     retrying: int = 0
     dead: int = 0
     skipped_open_circuit: int = 0
+    throttled: int = 0
 
 
 class DeliveryWorker:
@@ -46,13 +49,15 @@ class DeliveryWorker:
         self,
         sessionmaker: async_sessionmaker[AsyncSession],
         client: DeliveryClient,
-        breaker: CircuitBreaker,
+        breaker: Breaker,
         settings: Settings,
+        outbound_limiter: TokenBucketLimiter | None = None,
     ) -> None:
         self._sessionmaker = sessionmaker
         self._client = client
         self._breaker = breaker
         self._settings = settings
+        self._outbound_limiter = outbound_limiter
         self._last_reap = 0.0
 
     # ------------------------------------------------------------------ loop
@@ -108,9 +113,10 @@ class DeliveryWorker:
         #      guarantee.
         #
         # The cost is throughput per destination: one endpoint with a full batch queued
-        # is limited to one in-flight request. Fine while destinations are many and each
-        # has few events, which is the normal shape. Phase 5's token bucket makes the
-        # per-endpoint rate an explicit setting instead of an emergent 1.
+        # is limited to one in-flight request per worker. Fine while destinations are
+        # many and each has few events, which is the normal shape. The outbound token
+        # bucket then caps the aggregate across workers, which sequencing alone cannot -
+        # ten workers each doing one at a time is still ten concurrent requests.
         by_endpoint: dict[UUID, list[DeliveryJob]] = {}
         for job in jobs:
             by_endpoint.setdefault(job.endpoint_id, []).append(job)
@@ -130,15 +136,19 @@ class DeliveryWorker:
                     stats.dead += 1
                 case "skipped":
                     stats.skipped_open_circuit += 1
+                case "throttled":
+                    stats.throttled += 1
 
         log.info(
-            "batch: claimed=%d endpoints=%d delivered=%d retrying=%d dead=%d skipped=%d",
+            "batch: claimed=%d endpoints=%d delivered=%d retrying=%d dead=%d "
+            "skipped=%d throttled=%d",
             stats.claimed,
             len(by_endpoint),
             stats.delivered,
             stats.retrying,
             stats.dead,
             stats.skipped_open_circuit,
+            stats.throttled,
         )
         return stats
 
@@ -159,7 +169,22 @@ class DeliveryWorker:
     # ------------------------------------------------------------------ one delivery
 
     async def _process(self, job: DeliveryJob) -> str:
-        if not self._breaker.allows(job.endpoint_id):
+        # Checked before the breaker: being over the destination's rate budget is not a
+        # health signal about that destination, so it must not count toward opening its
+        # circuit. Like a breaker skip, no request is made and no attempt is consumed.
+        if self._outbound_limiter is not None:
+            budget = await self._outbound_limiter.check(f"ep:{job.endpoint_id}")
+            if not budget.allowed:
+                async with self._sessionmaker() as session:
+                    await DeliveryRepository(session).schedule_retry(
+                        job.delivery_id,
+                        delay_seconds=max(budget.retry_after_seconds, 0.1),
+                        error="deferred: endpoint delivery rate limit",
+                    )
+                    await session.commit()
+                return "throttled"
+
+        if not await self._breaker.allows(job.endpoint_id):
             # No request is made and no attempt is consumed - the endpoint is known to
             # be down, so spending part of this delivery's budget on it would be unfair
             # to the delivery.
@@ -197,11 +222,11 @@ class DeliveryWorker:
             )
 
             if outcome.succeeded:
-                self._breaker.record_success(job.endpoint_id)
+                await self._breaker.record_success(job.endpoint_id)
                 await repo.mark_delivered(job.delivery_id)
                 result = "delivered"
             else:
-                self._breaker.record_failure(job.endpoint_id)
+                await self._breaker.record_failure(job.endpoint_id)
                 if not outcome.retryable:
                     await repo.mark_dead(job.delivery_id, f"{outcome.error} (not retryable)")
                     result = "dead"
@@ -242,6 +267,19 @@ class DeliveryWorker:
             log.warning("reclaimed %d stale in_flight deliveries", reclaimed)
 
 
+def build_breaker(settings: Settings) -> Breaker:
+    if settings.circuit_breaker_backend == "redis":
+        return RedisCircuitBreaker(
+            get_redis(),
+            failure_threshold=settings.circuit_breaker_failure_threshold,
+            cooldown_seconds=settings.circuit_breaker_cooldown_seconds,
+        )
+    return InMemoryCircuitBreaker(
+        failure_threshold=settings.circuit_breaker_failure_threshold,
+        cooldown_seconds=settings.circuit_breaker_cooldown_seconds,
+    )
+
+
 def build_worker(
     settings: Settings, sessionmaker: async_sessionmaker[AsyncSession]
 ) -> tuple[DeliveryWorker, httpx.AsyncClient]:
@@ -253,13 +291,20 @@ def build_worker(
         follow_redirects=False,
         limits=httpx.Limits(max_connections=settings.worker_batch_size * 2),
     )
+    limiter = (
+        TokenBucketLimiter(
+            get_redis(),
+            capacity=settings.delivery_rate_limit_capacity,
+            refill_per_second=settings.delivery_rate_limit_per_second,
+        )
+        if settings.delivery_rate_limit_enabled
+        else None
+    )
     worker = DeliveryWorker(
         sessionmaker=sessionmaker,
         client=DeliveryClient(http, user_agent=f"{settings.app_name}/0.1.0"),
-        breaker=CircuitBreaker(
-            failure_threshold=settings.circuit_breaker_failure_threshold,
-            cooldown_seconds=settings.circuit_breaker_cooldown_seconds,
-        ),
+        breaker=build_breaker(settings),
         settings=settings,
+        outbound_limiter=limiter,
     )
     return worker, http

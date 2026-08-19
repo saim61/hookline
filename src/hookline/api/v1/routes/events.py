@@ -3,14 +3,19 @@ from uuid import UUID
 
 from fastapi import APIRouter, Header, HTTPException, Query, Response, status
 
-from hookline.api.deps import DeliveryRepoDep, EventIngestDep, EventRepoDep
+from hookline.api.deps import DeliveryRepoDep, EventIngestDep, EventRepoDep, RateLimited
 from hookline.schemas.delivery import DeliveryRead
 from hookline.schemas.event import EventAccepted, EventCreate, EventRead
 
 router = APIRouter(prefix="/events", tags=["events"])
 
 
-@router.post("", response_model=EventAccepted, status_code=status.HTTP_202_ACCEPTED)
+@router.post(
+    "",
+    response_model=EventAccepted,
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[RateLimited],
+)
 async def ingest_event(
     payload: EventCreate,
     service: EventIngestDep,

@@ -12,6 +12,7 @@ import logging
 import signal
 import sys
 
+from hookline.cache.client import close_redis
 from hookline.config import get_settings
 from hookline.db.session import dispose_engine, get_sessionmaker
 from hookline.worker.runner import build_worker
@@ -51,6 +52,7 @@ async def _run() -> None:
     finally:
         await http.aclose()
         await dispose_engine()
+        await close_redis()
 
 
 def main() -> None:

@@ -49,8 +49,16 @@ class EndpointRepository:
         )
         return list(result.scalars().all())
 
-    async def delete(self, endpoint_id: UUID) -> bool:
+    async def delete(self, endpoint_id: UUID) -> list[str] | None:
+        """Delete an endpoint, returning the event types it was subscribed to.
+
+        The caller needs those types to invalidate the subscriber cache, and after the
+        row is gone there is nowhere left to read them from. Returning them from the
+        DELETE itself avoids a SELECT beforehand and any window between the two.
+        None means no such endpoint.
+        """
         result = await self._session.execute(
-            delete(Endpoint).where(Endpoint.id == endpoint_id).returning(Endpoint.id)
+            delete(Endpoint).where(Endpoint.id == endpoint_id).returning(Endpoint.event_types)
         )
-        return result.scalar_one_or_none() is not None
+        row = result.scalar_one_or_none()
+        return list(row) if row is not None else None

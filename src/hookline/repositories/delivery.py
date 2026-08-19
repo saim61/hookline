@@ -4,7 +4,8 @@ from datetime import datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, literal, select, update
+from sqlalchemy.dialects.postgresql import UUID as PgUUID  # noqa: N811
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -44,38 +45,40 @@ class DeliveryRepository:
 
     async def create_many(
         self, event_id: UUID, endpoint_ids: Sequence[UUID], max_attempts: int
-    ) -> list[Delivery]:
-        """Fan one event out to a set of endpoints. Returns the rows actually created.
+    ) -> list[UUID]:
+        """Fan one event out to a set of endpoints. Returns the ids actually created.
 
-        ON CONFLICT DO NOTHING makes this safe to call twice for the same event: the
-        (event_id, endpoint_id) unique constraint absorbs the repeat and the second call
-        returns an empty list rather than duplicating deliveries.
+        INSERT ... SELECT FROM endpoints rather than INSERT ... VALUES, so the set of
+        rows is filtered by the database against live, active endpoints. That matters
+        because `endpoint_ids` may come from a cache: an id that was deleted since it was
+        cached would raise a foreign key violation and turn an ingest into a 500, and one
+        that was deactivated would be delivered to anyway. Filtering in the statement
+        makes a stale cache an optimisation problem instead of a correctness problem.
+
+        ON CONFLICT DO NOTHING covers the other direction - calling this twice for the
+        same event is absorbed by the (event_id, endpoint_id) unique constraint rather
+        than duplicating deliveries.
         """
         if not endpoint_ids:
             return []
 
+        source = (
+            select(
+                func.gen_random_uuid(),
+                literal(event_id, type_=PgUUID(as_uuid=True)),
+                Endpoint.id,
+                literal(max_attempts),
+            )
+            .where(Endpoint.id.in_(endpoint_ids))
+            .where(Endpoint.is_active.is_(True))
+        )
         stmt = (
             pg_insert(Delivery)
-            .values(
-                [
-                    {
-                        "id": uuid4(),
-                        "event_id": event_id,
-                        "endpoint_id": endpoint_id,
-                        "max_attempts": max_attempts,
-                    }
-                    for endpoint_id in endpoint_ids
-                ]
-            )
+            .from_select(["id", "event_id", "endpoint_id", "max_attempts"], source)
             .on_conflict_do_nothing(index_elements=[Delivery.event_id, Delivery.endpoint_id])
             .returning(Delivery.id)
         )
-        created_ids = list((await self._session.execute(stmt)).scalars().all())
-        if not created_ids:
-            return []
-
-        result = await self._session.execute(select(Delivery).where(Delivery.id.in_(created_ids)))
-        return list(result.scalars().all())
+        return list((await self._session.execute(stmt)).scalars().all())
 
     # ------------------------------------------------------------------ worker
 

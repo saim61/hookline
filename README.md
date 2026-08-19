@@ -7,10 +7,11 @@ and a permanent audit trail of every attempt.
 A smaller, readable implementation of what [Svix](https://svix.com) and
 [Hookdeck](https://hookdeck.com) sell as a product.
 
-> **Status:** in active development. Phase 4 of 10 complete — **the core is working end to
+> **Status:** in active development. Phase 5 of 10 complete — **the core is working end to
 > end.** Events are accepted, deduplicated, fanned out, signed, delivered with retries and
-> backoff, and dead-lettered when an endpoint stays down. What follows is hardening: rate
-> limiting, auth, observability, tests, a dashboard, and deployment. See [Roadmap](#roadmap).
+> backoff, rate limited in both directions, and dead-lettered when an endpoint stays down.
+> What follows is auth, observability, tests, a dashboard, and deployment.
+> See [Roadmap](#roadmap).
 
 ---
 
@@ -116,7 +117,7 @@ dashboard and replayable on demand.
 git clone <repo-url> && cd hookline
 cp .env.example .env          # defaults work as-is for local dev
 uv sync                       # install dependencies from uv.lock
-docker compose up -d          # start postgres, wait for healthy
+docker compose up -d          # start postgres + redis, wait for healthy
 uv run alembic upgrade head   # apply migrations
 ```
 
@@ -374,6 +375,90 @@ carry both the old and new signature, and a receiver accepting either sees no do
 Redirects are **not** followed. A customer endpoint returning a 302 is nearly always a
 misconfiguration, and following it would send a body signed for one host to a different one.
 
+### Rate limiting, in both directions
+
+Two token buckets, both in Redis so every replica shares one view:
+
+| | Keyed on | Protects | Default |
+|---|---|---|---|
+| **Inbound** | caller (client IP; API key from Phase 6) | Hookline | burst 100, 20/s |
+| **Outbound** | destination endpoint | the customer's server | burst 20, 10/s |
+
+Token bucket rather than a fixed window, because a fixed window has a boundary problem: with
+a 100/minute limit a caller can send 100 at 11:59:59 and 100 more at 12:00:00 and deliver 200
+requests in one second while staying inside the rules. A bucket refills continuously, so the
+capacity is the burst and the refill rate is the sustained rate, and both hold at every instant.
+
+The whole check is one Lua script. Read-modify-write from Python would race between replicas:
+two processes read "1 token left", both decide they may proceed, both write 0, and two requests
+go through on one token. It also uses **Redis's clock**, not the caller's — with several
+replicas, per-process clocks disagree by whatever their skew is, and a fast replica can hand out
+free tokens by claiming more time has passed than really has.
+
+Inbound limiting is attached to writes only. Throttling reads of the dead letter queue while an
+operator is working through an incident would be actively unhelpful, and reads are cheap.
+
+The outbound bucket is checked *before* the circuit breaker, deliberately: being over a
+destination's rate budget says nothing about that destination's health, so it must not count
+toward opening its circuit. Like a breaker skip, a throttled delivery makes no request and
+consumes no attempt.
+
+### Everything in Redis fails open
+
+Redis holds only derived state — buckets, breaker counters, cached subscriber lists. None of it
+is a source of truth, so every caller is written to keep working without it:
+
+| Redis down | Behaviour |
+|---|---|
+| Rate limiter | allows the request, flags `degraded` |
+| Circuit breaker | attempts the delivery — retry budget and backoff still bound the damage |
+| Subscriber cache | reads as a miss, falls through to Postgres |
+| `/ready` | still `200`, with `"redis": "degraded"` in the body |
+
+A rate limiter is a protection mechanism, not a correctness one. Rejecting every request when
+Redis is unreachable converts a Redis outage into a total outage, which is strictly worse than
+briefly serving unlimited traffic. Same logic for the breaker: it exists to protect customer
+endpoints from us, and if it is unavailable the right fallback is to deliver.
+
+`/ready` deliberately does **not** fail on Redis. Failing readiness would pull every pod from
+the load balancer to protect a feature that is already designed to be optional.
+
+### The subscriber cache
+
+`event_types @> ARRAY['order.created']` runs once per ingested event, which makes it the
+highest-frequency query in the system — and it is near-perfectly cacheable, since endpoint
+registrations change rarely while events arrive constantly.
+
+Invalidation is **explicit on every endpoint mutation**, with a 30s TTL only as a backstop for a
+crash between the write and the delete. TTL alone would mean a newly registered endpoint
+silently misses events for up to the TTL, which to whoever just registered it is
+indistinguishable from a bug.
+
+The cache cannot cause incorrect behaviour even when stale, because the fan-out insert filters
+the ids in the database:
+
+```sql
+INSERT INTO deliveries (id, event_id, endpoint_id, max_attempts)
+SELECT gen_random_uuid(), :event_id, e.id, :max_attempts
+  FROM endpoints e
+ WHERE e.id = ANY(:cached_ids) AND e.is_active
+    ON CONFLICT DO NOTHING
+```
+
+A cached id belonging to a deleted endpoint would otherwise raise a foreign key violation and
+turn an ingest into a `500`; a deactivated one would be delivered to anyway. Filtering inside
+the statement makes a stale cache an optimisation problem rather than a correctness one.
+
+### Circuit breaker backends
+
+`HOOKLINE_CIRCUIT_BREAKER_BACKEND` is `redis` (default) or `memory`.
+
+With `memory`, each worker holds its own view, so an endpoint can absorb up to N × threshold
+failures before every worker has tripped. With `redis`, one failure count is shared — and the
+half-open probe slot is claimed with `HSETNX`, so exactly one worker probes a recovering
+endpoint. Without that atomic claim, fifty workers reaching half-open together would each send
+"one" probe, which is not a probe, it is a small flood.
+
 ---
 
 ## Configuration
@@ -395,6 +480,15 @@ file. Defaults are in [`src/hookline/config.py`](src/hookline/config.py).
 | `HOOKLINE_RETRY_MAX_DELAY_SECONDS` | `3600.0` | Backoff cap |
 | `HOOKLINE_CIRCUIT_BREAKER_FAILURE_THRESHOLD` | `5` | Consecutive failures before an endpoint's circuit opens |
 | `HOOKLINE_CIRCUIT_BREAKER_COOLDOWN_SECONDS` | `60.0` | How long it stays open before a probe |
+| `HOOKLINE_CIRCUIT_BREAKER_BACKEND` | `redis` | `redis` (shared) or `memory` (per process) |
+| `HOOKLINE_REDIS_URL` | `redis://localhost:6379/0` | Redis connection |
+| `HOOKLINE_RATE_LIMIT_ENABLED` | `true` | Inbound limiting on write routes |
+| `HOOKLINE_RATE_LIMIT_CAPACITY` | `100` | Inbound burst allowance |
+| `HOOKLINE_RATE_LIMIT_REFILL_PER_SECOND` | `20.0` | Inbound sustained rate |
+| `HOOKLINE_DELIVERY_RATE_LIMIT_ENABLED` | `true` | Outbound limiting, per destination |
+| `HOOKLINE_DELIVERY_RATE_LIMIT_CAPACITY` | `20` | Outbound burst per endpoint |
+| `HOOKLINE_DELIVERY_RATE_LIMIT_PER_SECOND` | `10.0` | Outbound sustained rate per endpoint |
+| `HOOKLINE_SUBSCRIBER_CACHE_TTL_SECONDS` | `30` | Backstop TTL; invalidation is explicit |
 
 `MAX_DELIVERY_ATTEMPTS` is snapshotted onto each delivery at fan-out rather than read at retry
 time, so lowering it cannot retroactively dead-letter work already queued.
@@ -425,6 +519,10 @@ hookline/
     ├── main.py                  # app factory + lifespan
     ├── config.py                # pydantic-settings
     ├── enums.py                 # domain vocabulary shared by models and schemas
+    ├── cache/
+    │   ├── client.py            # redis pool
+    │   ├── ratelimit.py         # token bucket, one Lua script
+    │   └── subscribers.py       # subscriber list cache + invalidation
     ├── db/
     │   ├── base.py              # DeclarativeBase + constraint naming convention
     │   └── session.py           # engine, sessionmaker, per-request session
@@ -555,8 +653,8 @@ therefore uses `create_constraint=False` plus an explicit `CheckConstraint` in `
 | 2 | Postgres, SQLAlchemy 2.0 async, Alembic, repository pattern | ✅ done |
 | 3 | Events ingest, idempotency keys, fan-out, delivery + attempt tables | ✅ done |
 | 4 | **Delivery worker** — transactional outbox, `SKIP LOCKED`, backoff + jitter, circuit breaker, HMAC signing, DLQ + replay | ✅ done |
-| 5 | Redis — token bucket rate limiting, shared circuit breaker state, caching | next |
-| 6 | Auth — hashed API keys, scopes, incoming signature verification | |
+| 5 | Redis — token bucket rate limiting, shared circuit breaker state, subscriber cache | ✅ done |
+| 6 | Auth — hashed API keys, scopes, incoming signature verification | next |
 | 7 | Observability — structlog JSON logs, Prometheus, OpenTelemetry, probes | |
 | 8 | Testing — pytest, pytest-asyncio, testcontainers, k6 load test | |
 | 9 | Dashboard — HTMX + Jinja2, event log with a retry button | |
@@ -568,8 +666,8 @@ Everything after it is hardening rather than new capability.
 Known gaps, deliberately deferred:
 
 - **No authentication.** Every endpoint is open. Phase 6.
-- **No rate limiting.** A caller can ingest as fast as Postgres accepts writes. Phase 5.
-- **The circuit breaker is per worker process,** not shared. Phase 5 moves it to Redis.
+- **Rate limits are keyed on client IP,** which is both spoofable and shared behind a NAT.
+  Becomes the API key id in Phase 6.
 - **No automated test suite yet.** Each phase has been verified against a live server and
   Postgres with a scripted acceptance run, but those scripts are not committed and do not run
   in CI. Phase 8.
@@ -583,5 +681,6 @@ Known gaps, deliberately deferred:
 | Language | Python 3.13 |
 | Web framework | FastAPI, Pydantic v2 |
 | Database | PostgreSQL 17, SQLAlchemy 2.0 (async), asyncpg |
+| Cache / limits | Redis 8, redis-py asyncio, Lua for atomic operations |
 | Migrations | Alembic |
 | Tooling | uv, ruff, mypy (strict) |

@@ -16,5 +16,20 @@ services:
       timeout: 5s
       retries: 5
 
+  redis:
+    image: redis:8-alpine
+    container_name: hookline-redis
+    # No persistence on purpose. Everything Redis holds here - rate limit buckets,
+    # circuit breaker counters, the subscriber cache - is derived state that rebuilds
+    # itself. Losing it costs one cache miss and a reset breaker, never data.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
 volumes:
   pgdata:
