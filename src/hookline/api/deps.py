@@ -4,11 +4,13 @@ from fastapi import Depends, HTTPException, Request, status
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from hookline.auth.dependencies import Principal, PrincipalDep
 from hookline.cache.client import get_redis
 from hookline.cache.ratelimit import TokenBucketLimiter
 from hookline.cache.subscribers import SubscriberCache
 from hookline.config import Settings, get_settings
 from hookline.db.session import get_session
+from hookline.repositories.api_key import ApiKeyRepository
 from hookline.repositories.delivery import DeliveryRepository
 from hookline.repositories.endpoint import EndpointRepository
 from hookline.repositories.event import EventRepository
@@ -34,9 +36,14 @@ async def get_delivery_repo(session: SessionDep) -> DeliveryRepository:
     return DeliveryRepository(session)
 
 
+async def get_api_key_repo(session: SessionDep) -> ApiKeyRepository:
+    return ApiKeyRepository(session)
+
+
 EndpointRepoDep = Annotated[EndpointRepository, Depends(get_endpoint_repo)]
 EventRepoDep = Annotated[EventRepository, Depends(get_event_repo)]
 DeliveryRepoDep = Annotated[DeliveryRepository, Depends(get_delivery_repo)]
+ApiKeyRepoDep = Annotated[ApiKeyRepository, Depends(get_api_key_repo)]
 
 # Alias kept so the endpoints routes still read as `repo: RepoDep`. Now that several
 # repositories exist, new code should use the explicit name.
@@ -78,14 +85,17 @@ EventIngestDep = Annotated[EventIngestService, Depends(get_event_ingest_service)
 # --------------------------------------------------------------------- rate limiting
 
 
-def rate_limit_identity(request: Request) -> str:
+def rate_limit_identity(principal: Principal, request: Request) -> str:
     """Who the limit applies to.
 
-    Client IP for now. Phase 6 introduces API keys, at which point this becomes the key
-    id - which is the identity that actually matters, since IP is both spoofable and
-    shared (one NAT, one office, one limit for everybody behind it). Keeping the
-    resolution in one function means that change touches nothing else.
+    The API key, when there is one. IP is a poor identity for a limit: it is spoofable,
+    and it is shared - one office behind one NAT gets one bucket between them, so a busy
+    neighbour throttles everyone. The key identifies the actual caller.
+
+    Falls back to IP only when auth is disabled, since then there is no key to key on.
     """
+    if principal.authenticated:
+        return f"key:{principal.key_id}"
     if request.client is None:
         return "anonymous"
     return f"ip:{request.client.host}"
@@ -93,6 +103,7 @@ def rate_limit_identity(request: Request) -> str:
 
 async def enforce_rate_limit(
     request: Request,
+    principal: PrincipalDep,
     response_settings: SettingsDep,
     redis: RedisDep,
 ) -> None:
@@ -110,7 +121,7 @@ async def enforce_rate_limit(
         capacity=response_settings.rate_limit_capacity,
         refill_per_second=response_settings.rate_limit_refill_per_second,
     )
-    result = await limiter.check(rate_limit_identity(request))
+    result = await limiter.check(rate_limit_identity(principal, request))
     if result.allowed:
         return
 

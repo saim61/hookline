@@ -49,6 +49,14 @@ class Settings(BaseSettings):
     # independently.
     circuit_breaker_backend: Literal["redis", "memory"] = "redis"
 
+    # --- auth -------------------------------------------------------------------
+    # Off only for local experimentation and for the pre-auth acceptance scripts. When
+    # false every request is treated as holding the admin scope.
+    auth_enabled: bool = True
+    # How far a signed inbound request's timestamp may be from ours. Wide enough for
+    # ordinary clock skew, narrow enough that a captured request stops working.
+    inbound_signature_tolerance_seconds: int = Field(default=300, ge=1)
+
     # --- redis ------------------------------------------------------------------
     redis_url: str = "redis://localhost:6379/0"
 

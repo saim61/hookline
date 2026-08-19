@@ -4,6 +4,8 @@ from uuid import UUID
 from fastapi import APIRouter, Header, HTTPException, Query, Response, status
 
 from hookline.api.deps import DeliveryRepoDep, EventIngestDep, EventRepoDep, RateLimited
+from hookline.auth.dependencies import requires
+from hookline.auth.scopes import Scope
 from hookline.schemas.delivery import DeliveryRead
 from hookline.schemas.event import EventAccepted, EventCreate, EventRead
 
@@ -14,7 +16,7 @@ router = APIRouter(prefix="/events", tags=["events"])
     "",
     response_model=EventAccepted,
     status_code=status.HTTP_202_ACCEPTED,
-    dependencies=[RateLimited],
+    dependencies=[requires(Scope.EVENTS_WRITE), RateLimited],
 )
 async def ingest_event(
     payload: EventCreate,
@@ -54,7 +56,11 @@ async def ingest_event(
     )
 
 
-@router.get("", response_model=list[EventRead])
+@router.get(
+    "",
+    response_model=list[EventRead],
+    dependencies=[requires(Scope.EVENTS_READ)],
+)
 async def list_events(
     repo: EventRepoDep,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
@@ -64,7 +70,11 @@ async def list_events(
     return [EventRead.model_validate(e) for e in events]
 
 
-@router.get("/{event_id}", response_model=EventRead)
+@router.get(
+    "/{event_id}",
+    response_model=EventRead,
+    dependencies=[requires(Scope.EVENTS_READ)],
+)
 async def get_event(event_id: UUID, repo: EventRepoDep) -> EventRead:
     event = await repo.get(event_id)
     if event is None:
@@ -72,7 +82,11 @@ async def get_event(event_id: UUID, repo: EventRepoDep) -> EventRead:
     return EventRead.model_validate(event)
 
 
-@router.get("/{event_id}/deliveries", response_model=list[DeliveryRead])
+@router.get(
+    "/{event_id}/deliveries",
+    response_model=list[DeliveryRead],
+    dependencies=[requires(Scope.DELIVERIES_READ)],
+)
 async def list_event_deliveries(
     event_id: UUID,
     events: EventRepoDep,

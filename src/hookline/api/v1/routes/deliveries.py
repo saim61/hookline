@@ -3,14 +3,20 @@ from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, status
 
-from hookline.api.deps import DeliveryRepoDep, SettingsDep
+from hookline.api.deps import DeliveryRepoDep, RateLimited, SettingsDep
+from hookline.auth.dependencies import requires
+from hookline.auth.scopes import Scope
 from hookline.enums import DeliveryStatus
 from hookline.schemas.delivery import DeliveryAttemptRead, DeliveryRead
 
 router = APIRouter(prefix="/deliveries", tags=["deliveries"])
 
 
-@router.get("", response_model=list[DeliveryRead])
+@router.get(
+    "",
+    response_model=list[DeliveryRead],
+    dependencies=[requires(Scope.DELIVERIES_READ)],
+)
 async def list_deliveries(
     repo: DeliveryRepoDep,
     delivery_status: Annotated[
@@ -30,7 +36,11 @@ async def list_deliveries(
     return [DeliveryRead.model_validate(d) for d in rows]
 
 
-@router.get("/{delivery_id}", response_model=DeliveryRead)
+@router.get(
+    "/{delivery_id}",
+    response_model=DeliveryRead,
+    dependencies=[requires(Scope.DELIVERIES_READ)],
+)
 async def get_delivery(delivery_id: UUID, repo: DeliveryRepoDep) -> DeliveryRead:
     delivery = await repo.get(delivery_id)
     if delivery is None:
@@ -38,7 +48,11 @@ async def get_delivery(delivery_id: UUID, repo: DeliveryRepoDep) -> DeliveryRead
     return DeliveryRead.model_validate(delivery)
 
 
-@router.get("/{delivery_id}/attempts", response_model=list[DeliveryAttemptRead])
+@router.get(
+    "/{delivery_id}/attempts",
+    response_model=list[DeliveryAttemptRead],
+    dependencies=[requires(Scope.DELIVERIES_READ)],
+)
 async def list_delivery_attempts(
     delivery_id: UUID, repo: DeliveryRepoDep
 ) -> list[DeliveryAttemptRead]:
@@ -54,7 +68,11 @@ async def list_delivery_attempts(
     return [DeliveryAttemptRead.model_validate(a) for a in attempts]
 
 
-@router.post("/{delivery_id}/replay", response_model=DeliveryRead)
+@router.post(
+    "/{delivery_id}/replay",
+    response_model=DeliveryRead,
+    dependencies=[requires(Scope.DELIVERIES_WRITE), RateLimited],
+)
 async def replay_delivery(
     delivery_id: UUID, repo: DeliveryRepoDep, settings: SettingsDep
 ) -> DeliveryRead:

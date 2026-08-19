@@ -21,6 +21,9 @@ dependencies = [
 # hookline-worker on PATH inside the venv the same way `go install` produces a binary.
 [project.scripts]
 hookline-worker = "hookline.worker.__main__:main"
+# Key management talks to Postgres directly. The first admin key cannot be created over
+# HTTP, because creating a key requires a key.
+hookline-admin = "hookline.admin.__main__:main"
 
 [build-system]
 requires = ["uv_build>=0.12.5,<0.13.0"]

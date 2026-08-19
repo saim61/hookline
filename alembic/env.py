@@ -12,6 +12,7 @@ from hookline.db.base import Base
 # Imported for the side effect only: importing a model module registers its table on
 # Base.metadata. Without the import, autogenerate sees no table and emits an empty
 # migration with no error. Every new model needs a line here.
+from hookline.models.api_key import ApiKey  # noqa: F401
 from hookline.models.delivery import Delivery  # noqa: F401
 from hookline.models.delivery_attempt import DeliveryAttempt  # noqa: F401
 from hookline.models.endpoint import Endpoint  # noqa: F401

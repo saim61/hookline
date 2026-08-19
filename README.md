@@ -7,10 +7,10 @@ and a permanent audit trail of every attempt.
 A smaller, readable implementation of what [Svix](https://svix.com) and
 [Hookdeck](https://hookdeck.com) sell as a product.
 
-> **Status:** in active development. Phase 5 of 10 complete — **the core is working end to
-> end.** Events are accepted, deduplicated, fanned out, signed, delivered with retries and
-> backoff, rate limited in both directions, and dead-lettered when an endpoint stays down.
-> What follows is auth, observability, tests, a dashboard, and deployment.
+> **Status:** in active development. Phase 6 of 10 complete — **the core is working end to
+> end and the API is authenticated.** Events are accepted, deduplicated, fanned out, signed,
+> delivered with retries and backoff, rate limited in both directions, and dead-lettered when
+> an endpoint stays down. What follows is observability, tests, a dashboard, and deployment.
 > See [Roadmap](#roadmap).
 
 ---
@@ -119,6 +119,10 @@ cp .env.example .env          # defaults work as-is for local dev
 uv sync                       # install dependencies from uv.lock
 docker compose up -d          # start postgres + redis, wait for healthy
 uv run alembic upgrade head   # apply migrations
+
+# The API requires a key, and minting a key requires a key - so the first one is
+# created straight against the database. Copy the value it prints; it is shown once.
+uv run hookline-admin create-key --name "local dev"
 ```
 
 Then run the two processes, in separate terminals:
@@ -134,12 +138,23 @@ the correct behaviour and also the first thing to check when a webhook doesn't a
 
 Open <http://127.0.0.1:8000/docs> for the interactive API docs.
 
-Verify it's alive:
+Verify it's alive — the probes are deliberately unauthenticated, since a load balancer
+has no key:
 
 ```bash
 curl -s localhost:8000/health   # {"status":"ok"}  — process is up
-curl -s localhost:8000/ready    # {"status":"ok"}  — database reachable
+curl -s localhost:8000/ready    # database + redis status
 ```
+
+Everything under `/api/v1` needs the key:
+
+```bash
+export HL_KEY=hl_...
+curl -s localhost:8000/api/v1/endpoints -H "Authorization: Bearer $HL_KEY"
+```
+
+For quick local poking, `HOOKLINE_AUTH_ENABLED=false` treats every request as a fully
+privileged key. Never do that anywhere real.
 
 If port 5432 is already taken by a local Postgres install, change the mapping in
 `compose.yaml` to `"5433:5432"` and update `HOOKLINE_DATABASE_URL` to match.
@@ -164,6 +179,10 @@ If port 5432 is already taken by a local Postgres install, change the mapping in
 | `GET` | `/api/v1/deliveries/{id}` | One delivery's status, attempt count, next retry time. |
 | `GET` | `/api/v1/deliveries/{id}/attempts` | Every HTTP attempt made, with responses. |
 | `POST` | `/api/v1/deliveries/{id}/replay` | Requeue a dead delivery with a fresh budget. |
+| `POST` | `/api/v1/api-keys` | Mint a key. Returns the key **once**. `admin` only. |
+| `GET` | `/api/v1/api-keys` | List keys, without their values. `admin` only. |
+| `GET` | `/api/v1/api-keys/{id}` | One key's metadata. `admin` only. |
+| `POST` | `/api/v1/api-keys/{id}/revoke` | Deactivate a key, keeping the row. `admin` only. |
 
 `/health` and `/ready` are separate on purpose. Kubernetes treats them very differently: a
 failing liveness probe restarts the pod, a failing readiness probe just pulls it out of the load
@@ -375,6 +394,93 @@ carry both the old and new signature, and a receiver accepting either sees no do
 Redirects are **not** followed. A customer endpoint returning a 302 is nearly always a
 misconfiguration, and following it would send a body signed for one host to a different one.
 
+### Authentication
+
+Every `/api/v1` route needs `Authorization: Bearer hl_...`. `/health`, `/ready` and `/docs`
+stay open — a load balancer has no credential to present, and a probe that can fail on auth
+is a probe that reports the wrong thing.
+
+**Keys are stored as a SHA-256, never in the clear**, so a database dump is not enough to call
+the API. Two choices in that sentence deserve a note, because both look wrong at first glance.
+
+*Why not bcrypt or argon2.* Slow hashes exist to make brute force expensive against
+**low-entropy** secrets — humans pick `hunter2`, so every guess must cost milliseconds. A key
+here is 256 bits from `secrets.token_urlsafe(32)`; no amount of compute enumerates that space.
+Meanwhile a slow hash would run on **every authenticated request**, turning a
+login-hardening measure into self-inflicted denial of service: argon2 at 100ms per request caps
+the API at ten requests per second per core. Fast hash over a high-entropy secret is the correct
+trade, and it is what token systems generally do.
+
+*Why unsalted.* Authentication has to find the row **by** the presented key. A per-row salt
+would mean hashing the candidate against every stored key in turn — a full table scan on every
+request. A unique index on the digest makes it one indexed lookup. Salts defeat precomputation
+against weak secrets; there is no rainbow table for 256-bit random strings.
+
+Each key also stores an 11-character `display_prefix` in the clear, so a log line or dashboard
+row can identify *which* key it refers to without the key being recoverable from it.
+
+### Scopes
+
+| Scope | Grants |
+|---|---|
+| `endpoints:read` / `endpoints:write` | list/read vs register/delete destinations |
+| `events:read` / `events:write` | read the event log vs ingest |
+| `deliveries:read` / `deliveries:write` | read status and attempts vs replay |
+| `admin` | everything, including minting keys |
+
+Read and write are separate per resource so a key can hold exactly what it needs. In practice
+the checkout service only ingests, so it gets `events:write` and nothing else — and a leak of
+that key cannot read customers' signing secrets, delete endpoints, or mint new keys.
+
+`admin` is treated as a wildcard **at check time** rather than expanded into a list at
+creation. A key created today therefore covers a scope added next month, which is what an
+operator expects from something called admin, and avoids silently under-privileged keys after
+every release.
+
+`401` and `403` are kept distinct: `401` means we do not know who you are, `403` means we do and
+you may not. Conflating them makes a scope problem look like a credential problem and sends
+people hunting for the wrong bug. A revoked or expired key returns `401` — the *same* response
+as an unknown key, deliberately, since distinguishing them tells an attacker holding a leaked
+key that it was real.
+
+Revoking deactivates the row rather than deleting it. `name` and `last_used_at` survive, so
+"what was this key doing before we killed it" stays answerable — which is exactly the question
+an incident asks.
+
+`last_used_at` is written **at most once a minute per key**, gated by a Redis `SET NX EX`.
+Updating it on every request would add a row write to the hot path purely for a reporting field.
+
+### Signed inbound requests
+
+A key can be created with `require_signed_requests`, which gives it a signing secret and makes
+Hookline verify an HMAC over the request body — the same scheme Hookline uses for outbound
+deliveries, so one implementation serves both directions.
+
+```bash
+uv run hookline-admin create-key --name "checkout" --scopes events:write --signed-requests
+```
+
+Requests then need `webhook-id`, `webhook-timestamp` and `webhook-signature` alongside the
+bearer key. This buys two things a bearer token alone cannot:
+
+- The signature covers the body, so an intercepted request cannot be **modified** and reused.
+- The timestamp is part of the signed string, so a captured request **stops** being valid. A
+  bearer token replayed verbatim is accepted forever; a signed request is not.
+
+### Managing keys
+
+`hookline-admin` talks to Postgres directly, which is what breaks the chicken-and-egg problem:
+minting a key requires `admin`, which requires a key, so the first one cannot be created over
+HTTP. Anyone able to run the CLI already has database credentials, so it grants nothing they did
+not already have. It is also the way to revoke a leaked key when the API itself is what is
+misbehaving.
+
+```bash
+uv run hookline-admin create-key --name "checkout" --scopes events:write --expires-days 90
+uv run hookline-admin list-keys
+uv run hookline-admin revoke-key <id>
+```
+
 ### Rate limiting, in both directions
 
 Two token buckets, both in Redis so every replica shares one view:
@@ -489,6 +595,8 @@ file. Defaults are in [`src/hookline/config.py`](src/hookline/config.py).
 | `HOOKLINE_DELIVERY_RATE_LIMIT_CAPACITY` | `20` | Outbound burst per endpoint |
 | `HOOKLINE_DELIVERY_RATE_LIMIT_PER_SECOND` | `10.0` | Outbound sustained rate per endpoint |
 | `HOOKLINE_SUBSCRIBER_CACHE_TTL_SECONDS` | `30` | Backstop TTL; invalidation is explicit |
+| `HOOKLINE_AUTH_ENABLED` | `true` | Set false only for local poking |
+| `HOOKLINE_INBOUND_SIGNATURE_TOLERANCE_SECONDS` | `300` | Clock-skew window for signed requests |
 
 `MAX_DELIVERY_ATTEMPTS` is snapshotted onto each delivery at fan-out rather than read at retry
 time, so lowering it cannot retroactively dead-letter work already queued.
@@ -519,6 +627,12 @@ hookline/
     ├── main.py                  # app factory + lifespan
     ├── config.py                # pydantic-settings
     ├── enums.py                 # domain vocabulary shared by models and schemas
+    ├── auth/
+    │   ├── keys.py              # generate + hash api keys
+    │   ├── scopes.py            # what a key may do
+    │   └── dependencies.py      # bearer auth, scope checks, inbound signatures
+    ├── admin/
+    │   └── __main__.py          # `hookline-admin`, bootstrap and revoke keys
     ├── cache/
     │   ├── client.py            # redis pool
     │   ├── ratelimit.py         # token bucket, one Lua script
@@ -654,8 +768,8 @@ therefore uses `create_constraint=False` plus an explicit `CheckConstraint` in `
 | 3 | Events ingest, idempotency keys, fan-out, delivery + attempt tables | ✅ done |
 | 4 | **Delivery worker** — transactional outbox, `SKIP LOCKED`, backoff + jitter, circuit breaker, HMAC signing, DLQ + replay | ✅ done |
 | 5 | Redis — token bucket rate limiting, shared circuit breaker state, subscriber cache | ✅ done |
-| 6 | Auth — hashed API keys, scopes, incoming signature verification | next |
-| 7 | Observability — structlog JSON logs, Prometheus, OpenTelemetry, probes | |
+| 6 | Auth — hashed API keys, scopes, inbound signature verification | ✅ done |
+| 7 | Observability — structlog JSON logs, Prometheus, OpenTelemetry, probes | next |
 | 8 | Testing — pytest, pytest-asyncio, testcontainers, k6 load test | |
 | 9 | Dashboard — HTMX + Jinja2, event log with a retry button | |
 | 10 | Ship — multi-stage Dockerfile, Helm chart, Minikube, GitHub Actions | |
@@ -665,9 +779,10 @@ Everything after it is hardening rather than new capability.
 
 Known gaps, deliberately deferred:
 
-- **No authentication.** Every endpoint is open. Phase 6.
-- **Rate limits are keyed on client IP,** which is both spoofable and shared behind a NAT.
-  Becomes the API key id in Phase 6.
+- **No structured logging or metrics.** Logs are plain text and there is nothing to scrape.
+  Phase 7.
+- **No per-tenant isolation.** Every key sees every endpoint, event and delivery. Scopes limit
+  *what* a key can do, not *which rows* it can see. Multi-tenancy is not on the roadmap.
 - **No automated test suite yet.** Each phase has been verified against a live server and
   Postgres with a scripted acceptance run, but those scripts are not committed and do not run
   in CI. Phase 8.
