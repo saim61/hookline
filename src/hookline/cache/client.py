@@ -6,13 +6,12 @@ caller is written to work when Redis is unreachable. Losing Redis costs a cache 
 a reset breaker, and an unenforced rate limit; it never costs a delivery.
 """
 
-import logging
-
 from redis.asyncio import ConnectionPool, Redis
 
 from hookline.config import get_settings
+from hookline.observability.logging import get_logger
 
-log = logging.getLogger("hookline.cache")
+log = get_logger("hookline.cache")
 
 _pool: ConnectionPool | None = None
 

@@ -17,7 +17,6 @@ for a fixed timer and then releasing the whole backlog at once, or never noticin
 endpoint came back. One request answers the question at the cost of one request.
 """
 
-import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -27,7 +26,9 @@ from uuid import UUID
 
 from redis.asyncio import Redis
 
-log = logging.getLogger("hookline.breaker")
+from hookline.observability.logging import get_logger
+
+log = get_logger("hookline.breaker")
 
 
 class CircuitState(StrEnum):

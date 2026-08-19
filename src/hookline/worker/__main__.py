@@ -8,14 +8,20 @@ counts.
 """
 
 import asyncio
-import logging
 import signal
 import sys
+
+from prometheus_client import start_http_server
 
 from hookline.cache.client import close_redis
 from hookline.config import get_settings
 from hookline.db.session import dispose_engine, get_sessionmaker
+from hookline.observability import metrics
+from hookline.observability.logging import configure_logging, get_logger
+from hookline.observability.tracing import instrument_worker
 from hookline.worker.runner import build_worker
+
+log = get_logger("hookline.worker")
 
 
 def _install_signal_handlers(stop: asyncio.Event) -> None:
@@ -38,10 +44,15 @@ def _install_signal_handlers(stop: asyncio.Event) -> None:
 
 async def _run() -> None:
     settings = get_settings()
-    logging.basicConfig(
-        level=logging.DEBUG if settings.debug else logging.INFO,
-        format="%(asctime)s %(levelname)-7s %(name)s %(message)s",
-    )
+    configure_logging(debug=settings.debug, service=f"{settings.app_name}-worker")
+    instrument_worker(settings)
+
+    if settings.metrics_enabled:
+        # The worker serves no HTTP of its own, so Prometheus has nothing to scrape unless
+        # it starts a listener. A separate port from the API's, since these are two
+        # processes with two sets of numbers.
+        start_http_server(settings.worker_metrics_port, registry=metrics.REGISTRY)
+        log.info("metrics listening", port=settings.worker_metrics_port)
 
     stop = asyncio.Event()
     _install_signal_handlers(stop)

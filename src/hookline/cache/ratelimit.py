@@ -12,12 +12,13 @@ write 0, and two requests get through on one token. Redis runs a script atomical
 the read, the refill and the decrement cannot be interleaved.
 """
 
-import logging
 from dataclasses import dataclass
 
 from redis.asyncio import Redis
 
-log = logging.getLogger("hookline.ratelimit")
+from hookline.observability.logging import get_logger
+
+log = get_logger("hookline.ratelimit")
 
 # Returns {allowed, tokens_left, retry_after_ms}.
 #

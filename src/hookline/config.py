@@ -49,6 +49,16 @@ class Settings(BaseSettings):
     # independently.
     circuit_breaker_backend: Literal["redis", "memory"] = "redis"
 
+    # --- observability ----------------------------------------------------------
+    # /metrics on the API. Left open like the health probes: Prometheus scrapes with no
+    # credential, and in a cluster the port is not routed publicly anyway.
+    metrics_enabled: bool = True
+    # The worker has no HTTP server of its own, so it starts a tiny one just for /metrics.
+    worker_metrics_port: int = Field(default=9100, ge=1, le=65535)
+    # OTLP/HTTP collector, e.g. http://localhost:4318/v1/traces. Tracing stays off when
+    # unset - an SDK exporting nowhere costs per-span work and pretends to be wired up.
+    otel_endpoint: str | None = None
+
     # --- auth -------------------------------------------------------------------
     # Off only for local experimentation and for the pre-auth acceptance scripts. When
     # false every request is treated as holding the admin scope.

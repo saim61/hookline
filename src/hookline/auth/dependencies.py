@@ -1,6 +1,5 @@
 """Authentication and authorisation as FastAPI dependencies."""
 
-import logging
 import time
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
@@ -18,9 +17,10 @@ from hookline.cache.client import get_redis
 from hookline.config import Settings, get_settings
 from hookline.db.session import get_session
 from hookline.delivery import signing
+from hookline.observability.logging import get_logger
 from hookline.repositories.api_key import ApiKeyRepository
 
-log = logging.getLogger("hookline.auth")
+log = get_logger("hookline.auth")
 
 # auto_error=False so a missing header reaches our own handler and produces a consistent
 # message, rather than FastAPI's generic 403.

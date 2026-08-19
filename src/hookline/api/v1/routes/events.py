@@ -6,8 +6,12 @@ from fastapi import APIRouter, Header, HTTPException, Query, Response, status
 from hookline.api.deps import DeliveryRepoDep, EventIngestDep, EventRepoDep, RateLimited
 from hookline.auth.dependencies import requires
 from hookline.auth.scopes import Scope
+from hookline.observability import metrics
+from hookline.observability.logging import get_logger
 from hookline.schemas.delivery import DeliveryRead
 from hookline.schemas.event import EventAccepted, EventCreate, EventRead
+
+log = get_logger("hookline.ingest")
 
 router = APIRouter(prefix="/events", tags=["events"])
 
@@ -46,6 +50,22 @@ async def ingest_event(
     # Lets a caller distinguish "we accepted your event" from "you already sent this"
     # without having to diff the body against what they sent.
     response.headers["Idempotent-Replay"] = "true" if result.duplicate else "false"
+
+    metrics.events_ingested.labels(duplicate=str(result.duplicate).lower()).inc()
+    if result.deliveries_scheduled:
+        metrics.deliveries_scheduled.inc(result.deliveries_scheduled)
+    metrics.subscriber_cache_lookups.labels(
+        result="hit" if result.subscribers_cached else "miss"
+    ).inc()
+
+    log.info(
+        "event ingested",
+        event_id=str(result.event.id),
+        event_type=result.event.event_type,
+        deliveries_scheduled=result.deliveries_scheduled,
+        duplicate=result.duplicate,
+        subscribers_cached=result.subscribers_cached,
+    )
 
     return EventAccepted(
         id=result.event.id,

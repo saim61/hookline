@@ -1,6 +1,5 @@
 import asyncio
 import contextlib
-import logging
 import time
 from dataclasses import dataclass
 from uuid import UUID
@@ -14,9 +13,11 @@ from hookline.config import Settings
 from hookline.delivery.backoff import next_delay_seconds
 from hookline.delivery.breaker import Breaker, InMemoryCircuitBreaker, RedisCircuitBreaker
 from hookline.delivery.client import DeliveryClient, build_body
+from hookline.observability import metrics
+from hookline.observability.logging import get_logger
 from hookline.repositories.delivery import DeliveryJob, DeliveryRepository
 
-log = logging.getLogger("hookline.worker")
+log = get_logger("hookline.worker")
 
 
 @dataclass(slots=True)
@@ -64,10 +65,11 @@ class DeliveryWorker:
 
     async def run_forever(self, stop: asyncio.Event) -> None:
         log.info(
-            "worker started (batch=%d, poll=%.1fs, max_attempts=%d)",
-            self._settings.worker_batch_size,
-            self._settings.worker_poll_interval_seconds,
-            self._settings.max_delivery_attempts,
+            "worker started",
+            batch_size=self._settings.worker_batch_size,
+            poll_interval_seconds=self._settings.worker_poll_interval_seconds,
+            max_attempts=self._settings.max_delivery_attempts,
+            breaker_backend=self._settings.circuit_breaker_backend,
         )
         while not stop.is_set():
             try:
@@ -139,16 +141,26 @@ class DeliveryWorker:
                 case "throttled":
                     stats.throttled += 1
 
+        metrics.worker_batches.inc()
+        for outcome, count in (
+            ("delivered", stats.delivered),
+            ("retrying", stats.retrying),
+            ("dead", stats.dead),
+            ("skipped", stats.skipped_open_circuit),
+            ("throttled", stats.throttled),
+        ):
+            if count:
+                metrics.worker_outcomes.labels(outcome=outcome).inc(count)
+
         log.info(
-            "batch: claimed=%d endpoints=%d delivered=%d retrying=%d dead=%d "
-            "skipped=%d throttled=%d",
-            stats.claimed,
-            len(by_endpoint),
-            stats.delivered,
-            stats.retrying,
-            stats.dead,
-            stats.skipped_open_circuit,
-            stats.throttled,
+            "batch",
+            claimed=stats.claimed,
+            endpoints=len(by_endpoint),
+            delivered=stats.delivered,
+            retrying=stats.retrying,
+            dead=stats.dead,
+            skipped_open_circuit=stats.skipped_open_circuit,
+            throttled=stats.throttled,
         )
         return stats
 
@@ -162,7 +174,11 @@ class DeliveryWorker:
                 # The row stays in_flight and the reaper will return it later. Recording
                 # a guessed state would be worse than recording nothing. Carry on with
                 # this endpoint's remaining jobs rather than abandoning the group.
-                log.exception("delivery %s errored outside the client", job.delivery_id)
+                log.exception(
+                    "delivery errored outside the client",
+                    delivery_id=str(job.delivery_id),
+                    endpoint_id=str(job.endpoint_id),
+                )
                 results.append("errored")
         return results
 
@@ -210,6 +226,12 @@ class DeliveryWorker:
             body=body,
         )
 
+        metrics.delivery_attempts.labels(
+            outcome="success" if outcome.succeeded else "failure",
+            status_class=metrics.status_class(outcome.status_code),
+        ).inc()
+        metrics.delivery_duration.observe(outcome.duration_ms / 1000.0)
+
         async with self._sessionmaker() as session:
             repo = DeliveryRepository(session)
             await repo.record_attempt(
@@ -246,6 +268,19 @@ class DeliveryWorker:
                     result = "retrying"
 
             await session.commit()
+
+        log.info(
+            "attempt",
+            delivery_id=str(job.delivery_id),
+            endpoint_id=str(job.endpoint_id),
+            event_type=job.event_type,
+            attempt=job.attempt_number,
+            max_attempts=job.max_attempts,
+            status_code=outcome.status_code,
+            duration_ms=outcome.duration_ms,
+            result=result,
+            error=outcome.error,
+        )
         return result
 
     # ------------------------------------------------------------------ reaper
@@ -264,7 +299,8 @@ class DeliveryWorker:
             )
             await session.commit()
         if reclaimed:
-            log.warning("reclaimed %d stale in_flight deliveries", reclaimed)
+            metrics.stale_reclaimed.inc(reclaimed)
+            log.warning("reclaimed stale in_flight deliveries", count=reclaimed)
 
 
 def build_breaker(settings: Settings) -> Breaker:

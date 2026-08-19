@@ -7,11 +7,10 @@ and a permanent audit trail of every attempt.
 A smaller, readable implementation of what [Svix](https://svix.com) and
 [Hookdeck](https://hookdeck.com) sell as a product.
 
-> **Status:** in active development. Phase 6 of 10 complete — **the core is working end to
-> end and the API is authenticated.** Events are accepted, deduplicated, fanned out, signed,
-> delivered with retries and backoff, rate limited in both directions, and dead-lettered when
-> an endpoint stays down. What follows is observability, tests, a dashboard, and deployment.
-> See [Roadmap](#roadmap).
+> **Status:** in active development. Phase 7 of 10 complete — the core works end to end, the
+> API is authenticated, and the whole thing is observable: JSON logs with request
+> correlation, Prometheus metrics, and optional OpenTelemetry traces. What remains is an
+> automated test suite, a dashboard, and deployment. See [Roadmap](#roadmap).
 
 ---
 
@@ -597,6 +596,9 @@ file. Defaults are in [`src/hookline/config.py`](src/hookline/config.py).
 | `HOOKLINE_SUBSCRIBER_CACHE_TTL_SECONDS` | `30` | Backstop TTL; invalidation is explicit |
 | `HOOKLINE_AUTH_ENABLED` | `true` | Set false only for local poking |
 | `HOOKLINE_INBOUND_SIGNATURE_TOLERANCE_SECONDS` | `300` | Clock-skew window for signed requests |
+| `HOOKLINE_METRICS_ENABLED` | `true` | Serve `/metrics` |
+| `HOOKLINE_WORKER_METRICS_PORT` | `9100` | Worker's scrape port |
+| `HOOKLINE_OTEL_ENDPOINT` | *(unset)* | OTLP/HTTP collector; tracing off when unset |
 
 `MAX_DELIVERY_ATTEMPTS` is snapshotted onto each delivery at fan-out rather than read at retry
 time, so lowering it cannot retroactively dead-letter work already queued.
@@ -633,6 +635,12 @@ hookline/
     │   └── dependencies.py      # bearer auth, scope checks, inbound signatures
     ├── admin/
     │   └── __main__.py          # `hookline-admin`, bootstrap and revoke keys
+    ├── observability/
+    │   ├── logging.py           # structlog, JSON or console
+    │   ├── context.py           # request id contextvar
+    │   ├── middleware.py        # request id, access log, http metrics
+    │   ├── metrics.py           # prometheus collectors
+    │   └── tracing.py           # opentelemetry, opt-in
     ├── cache/
     │   ├── client.py            # redis pool
     │   ├── ratelimit.py         # token bucket, one Lua script
@@ -758,6 +766,127 @@ therefore uses `create_constraint=False` plus an explicit `CheckConstraint` in `
 
 ---
 
+## Observability
+
+Three signals, answering three different questions. Metrics say *that* p99 ingest latency
+doubled. Logs say *what happened* to one particular delivery. Traces say *which span inside a
+slow request* took the time. None substitutes for another.
+
+### Structured logs
+
+JSON by default, one object per line; colourised key=value when `HOOKLINE_DEBUG=true`.
+
+```json
+{"event": "attempt", "delivery_id": "5e63...", "endpoint_id": "6283...",
+ "event_type": "order.created", "attempt": 2, "max_attempts": 5, "status_code": 503,
+ "duration_ms": 41, "result": "retrying", "request_id": "2a63...",
+ "service": "hookline-worker", "level": "info", "timestamp": "2026-08-19T10:46:22.266Z"}
+```
+
+The point of the shape: `log.info("attempt", status_code=503, delivery_id=...)` is a queryable
+object, where `log.info(f"attempt on {id} got 503")` is a sentence someone writes a regex
+against a year later. "Every failed delivery to endpoint X in the last hour" becomes a filter
+rather than archaeology.
+
+stdlib `logging` is routed through the same pipeline, so uvicorn, SQLAlchemy and httpx come out
+in the same format instead of interleaving two conventions in one stream. uvicorn's access log
+is switched off - the middleware already emits one structured line per request with timing,
+status and request id, and running both doubles the volume while making the useful one harder
+to find.
+
+### Request correlation
+
+Every response carries `X-Request-ID`. A caller-supplied one is honoured so an id can span
+several services; otherwise one is generated. Either way it is stamped onto **every** log line
+emitted while handling that request - including lines from deep inside a repository - so a user
+quoting an id from a failed call finds the exact request and everything that happened in it.
+
+That is carried in a `contextvar`, not a parameter. Threading it through five layers purely so
+logging can see it would spread an observability concern across every signature. contextvars are
+also the async-correct choice: each task gets its own copy, so two concurrent requests never see
+each other's id.
+
+The middleware is raw ASGI rather than `BaseHTTPMiddleware`, which matters here.
+`BaseHTTPMiddleware` runs the request inside its own anyio task group, and contextvars set there
+are invisible to the handler - which would defeat the entire feature.
+
+### Metrics
+
+`/metrics` on the API (port 8000) and on the worker (port 9100, since the worker serves no HTTP
+of its own). Both unauthenticated, like the health probes: Prometheus carries no API key, and in
+a cluster neither port is routed publicly.
+
+| Metric | Type | Notes |
+|---|---|---|
+| `hookline_http_requests_total{method,route,status}` | counter | |
+| `hookline_http_request_duration_seconds{method,route}` | histogram | buckets from 1ms |
+| `hookline_events_ingested_total{duplicate}` | counter | separates idempotent replays |
+| `hookline_deliveries_scheduled_total` | counter | fan-out rows created |
+| `hookline_subscriber_cache_lookups_total{result}` | counter | cache hit rate |
+| `hookline_delivery_attempts_total{outcome,status_class}` | counter | |
+| `hookline_delivery_duration_seconds` | histogram | includes timeouts |
+| `hookline_worker_delivery_outcomes_total{outcome}` | counter | delivered / retrying / dead / skipped / throttled |
+| `hookline_stale_deliveries_reclaimed_total` | counter | should normally stay flat at zero |
+| `hookline_deliveries{status}` | gauge | queue depth, sampled from the table |
+| `hookline_oldest_pending_delivery_age_seconds` | gauge | how far behind the worker is |
+
+Three deliberate choices, each a common way to get this wrong.
+
+**Routes are labelled by template, never by path.** `route="/api/v1/events/{event_id}"` is one
+time series; the concrete path would be one series *per event*, which is how a monitoring system
+gets taken down by the thing it was installed to monitor. Unmatched 404s collapse to
+`route="unmatched"` for the same reason. The full prefix is reconstructed on the way out, because
+the matched route only knows its path within its own router - using it raw would drop `/api/v1`
+and make a future v2 collide with v1.
+
+**Attempts are labelled by status class, not status code.** `5xx` is one series; nobody alerts on
+the difference between 502 and 503.
+
+**Queue depth is sampled at scrape time**, because it describes the *table*, not the process - a
+delivery created by replica A has to appear in replica B's numbers too. That means every replica
+reports the same value, so **aggregate it with `max()`, never `sum()`**. Summing across three
+replicas turns a queue of 40 into a graph showing 120 and an alert nobody trusts. Zeroes are
+reported explicitly rather than omitted, because PromQL treats an absent series very differently
+from one holding 0.
+
+Useful starting queries:
+
+```promql
+# ingest latency, p99
+histogram_quantile(0.99, sum by (le) (
+  rate(hookline_http_request_duration_seconds_bucket{route="/api/v1/events"}[5m])))
+
+# delivery success rate
+sum(rate(hookline_delivery_attempts_total{outcome="success"}[5m]))
+  / sum(rate(hookline_delivery_attempts_total[5m]))
+
+# the queue is falling behind - note max(), not sum()
+max(hookline_oldest_pending_delivery_age_seconds) > 300
+
+# something is crash-looping mid-delivery
+rate(hookline_stale_deliveries_reclaimed_total[15m]) > 0
+```
+
+### Tracing
+
+Off unless `HOOKLINE_OTEL_ENDPOINT` points at an OTLP/HTTP collector:
+
+```bash
+HOOKLINE_OTEL_ENDPOINT=http://localhost:4318/v1/traces uv run fastapi dev src/hookline/main.py
+```
+
+FastAPI, SQLAlchemy and httpx are auto-instrumented, so one trace shows the request, the queries
+inside it, and the outbound POST to the customer endpoint. Health and metrics URLs are excluded -
+they would be the overwhelming majority of spans and are never the thing under investigation.
+
+Opt-in on purpose: an SDK exporting nowhere still costs per-span allocation on every request, and
+silently dropping spans is worse than not tracing, because it looks instrumented and is not.
+Spans go through `BatchSpanProcessor`, not `SimpleSpanProcessor` - the simple one exports
+synchronously on span end, putting a network round trip to the collector inside the request it is
+supposed to be measuring.
+
+---
+
 ## Roadmap
 
 | Phase | Scope | Status |
@@ -769,8 +898,8 @@ therefore uses `create_constraint=False` plus an explicit `CheckConstraint` in `
 | 4 | **Delivery worker** — transactional outbox, `SKIP LOCKED`, backoff + jitter, circuit breaker, HMAC signing, DLQ + replay | ✅ done |
 | 5 | Redis — token bucket rate limiting, shared circuit breaker state, subscriber cache | ✅ done |
 | 6 | Auth — hashed API keys, scopes, inbound signature verification | ✅ done |
-| 7 | Observability — structlog JSON logs, Prometheus, OpenTelemetry, probes | next |
-| 8 | Testing — pytest, pytest-asyncio, testcontainers, k6 load test | |
+| 7 | Observability — structlog JSON logs, Prometheus, OpenTelemetry, probes | ✅ done |
+| 8 | Testing — pytest, pytest-asyncio, testcontainers, k6 load test | next |
 | 9 | Dashboard — HTMX + Jinja2, event log with a retry button | |
 | 10 | Ship — multi-stage Dockerfile, Helm chart, Minikube, GitHub Actions | |
 
@@ -779,8 +908,6 @@ Everything after it is hardening rather than new capability.
 
 Known gaps, deliberately deferred:
 
-- **No structured logging or metrics.** Logs are plain text and there is nothing to scrape.
-  Phase 7.
 - **No per-tenant isolation.** Every key sees every endpoint, event and delivery. Scopes limit
   *what* a key can do, not *which rows* it can see. Multi-tenancy is not on the roadmap.
 - **No automated test suite yet.** Each phase has been verified against a live server and
@@ -797,5 +924,6 @@ Known gaps, deliberately deferred:
 | Web framework | FastAPI, Pydantic v2 |
 | Database | PostgreSQL 17, SQLAlchemy 2.0 (async), asyncpg |
 | Cache / limits | Redis 8, redis-py asyncio, Lua for atomic operations |
+| Observability | structlog, prometheus-client, OpenTelemetry |
 | Migrations | Alembic |
 | Tooling | uv, ruff, mypy (strict) |

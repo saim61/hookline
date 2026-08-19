@@ -10,12 +10,13 @@ Relying on TTL alone would mean a newly registered endpoint silently misses even
 up to the TTL - which looks exactly like a bug to whoever just registered it.
 """
 
-import logging
 from uuid import UUID
 
 from redis.asyncio import Redis
 
-log = logging.getLogger("hookline.cache")
+from hookline.observability.logging import get_logger
+
+log = get_logger("hookline.cache")
 
 _MISS = object()
 
