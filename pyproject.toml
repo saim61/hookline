@@ -41,7 +41,9 @@ dev = [
     "mypy>=2.3.1",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
+    "pytest-cov>=7.1.0",
     "ruff>=0.16.3",
+    "testcontainers>=4.15.0",
 ]
 
 [tool.ruff]
@@ -55,3 +57,56 @@ select = ["E", "F", "I", "N", "UP", "B", "ASYNC", "RUF"]
 python_version = "3.13"
 strict = true
 plugins = ["pydantic.mypy"]
+
+[tool.pytest.ini_options]
+# auto mode so async tests need no per-test marker. The whole suite is async; marking
+# every function would be noise.
+asyncio_mode = "auto"
+# One event loop for the whole session, for both tests and fixtures. The engine and Redis
+# pools are created lazily on first use and bound to the loop that created them; with a
+# loop per test, an engine built in test A is disposed against a loop that no longer
+# exists, which surfaces as asyncpg writing to a closed proactor on Windows.
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+testpaths = ["tests"]
+addopts = "-q --strict-markers --strict-config"
+markers = [
+    "slow: takes more than a second, usually because it waits on a real timeout",
+]
+filterwarnings = [
+    "error",
+    # testcontainers and its dependencies emit these; not ours to fix.
+    "ignore::DeprecationWarning:testcontainers.*",
+    "ignore::DeprecationWarning:docker.*",
+    # Windows proactor transports close their sockets on the event loop, which finishes
+    # after pytest has already run its garbage collection check. The pools are disposed in
+    # the _clean_state fixture; this is teardown ordering, not a leak.
+    "ignore::ResourceWarning",
+]
+
+[tool.coverage.run]
+source = ["src/hookline"]
+branch = true
+# SQLAlchemy's asyncio layer runs the synchronous core inside a greenlet, and coverage's
+# tracer does not follow greenlet switches on its own. Without this, code that awaits a
+# query appears unexecuted even when it demonstrably ran - which is worse than no coverage
+# number, because it sends you writing tests for paths that are already covered.
+concurrency = ["greenlet", "thread"]
+omit = [
+    # Entrypoints are exercised by running them, not by importing them; asserting on
+    # argparse wiring buys nothing.
+    "src/hookline/admin/__main__.py",
+    "src/hookline/worker/__main__.py",
+    # Tracing is opt-in and needs a live collector to mean anything.
+    "src/hookline/observability/tracing.py",
+]
+
+[tool.coverage.report]
+skip_covered = false
+show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    '\.\.\.',
+]

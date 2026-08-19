@@ -7,10 +7,9 @@ and a permanent audit trail of every attempt.
 A smaller, readable implementation of what [Svix](https://svix.com) and
 [Hookdeck](https://hookdeck.com) sell as a product.
 
-> **Status:** in active development. Phase 7 of 10 complete — the core works end to end, the
-> API is authenticated, and the whole thing is observable: JSON logs with request
-> correlation, Prometheus metrics, and optional OpenTelemetry traces. What remains is an
-> automated test suite, a dashboard, and deployment. See [Roadmap](#roadmap).
+> **Status:** in active development. Phase 8 of 10 complete — the core works end to end, the
+> API is authenticated and observable, and there are **257 tests at 94% coverage** running
+> in 40 seconds. What remains is a dashboard and deployment. See [Roadmap](#roadmap).
 
 ---
 
@@ -622,6 +621,10 @@ hookline/
 ├── pyproject.toml               # deps + ruff/mypy config
 ├── uv.lock                      # committed, pinned dependency graph
 ├── alembic.ini
+├── tests/
+│   ├── unit/                     # no database, no network, no sleeping
+│   ├── integration/              # real postgres, real redis, fake receiver
+│   └── load/                     # k6, run by hand
 ├── alembic/
 │   ├── env.py                   # wires alembic to app settings + metadata
 │   └── versions/                # migrations, reviewed by hand
@@ -718,9 +721,10 @@ fails halfway leaves nothing behind for a worker to find.
 ```bash
 uv run fastapi dev src/hookline/main.py    # api, with reload
 uv run hookline-worker                     # delivery worker
+uv run pytest                              # 257 tests, ~40s
 uv run ruff check --fix . && uv run ruff format .
 uv run mypy src                            # strict mode, must stay clean
-docker compose ps                          # db should report "healthy"
+docker compose ps                          # db and redis should report "healthy"
 ```
 
 Handy while poking at the worker — turn a normally hour-long retry schedule into seconds:
@@ -887,6 +891,86 @@ supposed to be measuring.
 
 ---
 
+## Testing
+
+```bash
+uv run pytest                      # 257 tests, ~40s
+uv run pytest tests/unit           # no database, no network, instant
+uv run pytest --cov --cov-report=term-missing
+```
+
+Two layers, split by what they need rather than by what they are called:
+
+**`tests/unit/`** — backoff, the circuit breaker state machine, signing, key hashing, scope
+resolution, schema validation, and the delivery client's retryability rules. No database, no
+Redis, no network, no sleeping. The circuit breaker takes an injected clock and backoff takes an
+injected `Random`, which is the reason a 60-second cooldown and a jitter distribution can both be
+tested exhaustively in milliseconds.
+
+**`tests/integration/`** — the API over ASGI, the repositories against real Postgres, the rate
+limiter and shared breaker against real Redis, and the worker delivering to a fake receiver that
+verifies the HMAC on arrival. Signing is therefore checked from the *receiver's* side, not only
+against itself.
+
+### Infrastructure
+
+By default the suite reuses the compose services on a dedicated database (`hookline_test`) and
+Redis db index 15, so a test run can never truncate the table you were about to demo from. Set
+`HOOKLINE_TEST_CONTAINERS=1` to start throwaway Postgres and Redis containers instead — slower,
+but needs nothing running, which is what CI wants. Both paths are verified.
+
+Schema comes from running the real `alembic upgrade head`, not `Base.metadata.create_all`. That
+means a broken migration fails the suite, which the shortcut would quietly hide.
+
+### Things worth knowing if you touch the fixtures
+
+**One event loop for the whole session.** The engine and Redis pools are process-wide singletons
+bound to the loop that created them. With a loop per test, an engine built in test A gets
+disposed against a loop that no longer exists — which surfaces on Windows as asyncpg writing to a
+closed proactor, a long way from the actual cause.
+
+**State is reset by `TRUNCATE`, not by rolling back a transaction.** The code under test manages
+its own transactions and commits, and the worker uses several sessions per delivery, so wrapping
+a test in one outer transaction does not survive contact with it.
+
+**The worker is driven with `run_once()`, never `run_forever()`.** A polling loop in the
+background makes tests race a timer, and those flakes get "fixed" with sleeps until the suite is
+slow and still flaky. Driving each batch explicitly means every assertion runs at a known point
+in the lifecycle.
+
+**Environment is set at the top of `conftest.py`, before any `hookline` import.** `get_settings()`
+is `lru_cache`d, so the first call decides the database URL for the whole process — by the time a
+fixture body runs it is far too late.
+
+### Coverage, and a number that was lying
+
+94% of `src/hookline`, and it only became true after adding:
+
+```toml
+[tool.coverage.run]
+concurrency = ["greenlet", "thread"]
+```
+
+SQLAlchemy's asyncio layer runs the synchronous core inside a greenlet, and coverage's tracer
+does not follow greenlet switches on its own. Without that line, any code path that awaits a
+query is reported as unexecuted. `repositories/event.py` sat at 66% with the idempotency conflict
+branch marked uncovered — while a test asserting `duplicate is True` was passing, which is only
+reachable *through* that branch. This is worse than having no coverage number, because it sends
+you writing tests for paths that are already covered while real gaps stay hidden.
+
+The three entrypoint and tracing modules are excluded rather than padded: `hookline-admin` and
+`hookline-worker` are exercised by running them, and tracing needs a live collector to mean
+anything.
+
+### Load test
+
+k6, in `tests/load/`. Not run by pytest — it takes minutes and needs a real server. It measures
+one thing: that ingest latency stays flat as the delivery backlog grows. If p95 climbs with queue
+depth, something has coupled ingest to delivery, which is the whole point of the outbox. See
+[tests/load/README.md](tests/load/README.md).
+
+---
+
 ## Roadmap
 
 | Phase | Scope | Status |
@@ -899,8 +983,8 @@ supposed to be measuring.
 | 5 | Redis — token bucket rate limiting, shared circuit breaker state, subscriber cache | ✅ done |
 | 6 | Auth — hashed API keys, scopes, inbound signature verification | ✅ done |
 | 7 | Observability — structlog JSON logs, Prometheus, OpenTelemetry, probes | ✅ done |
-| 8 | Testing — pytest, pytest-asyncio, testcontainers, k6 load test | next |
-| 9 | Dashboard — HTMX + Jinja2, event log with a retry button | |
+| 8 | Testing — pytest, pytest-asyncio, testcontainers, k6 load test | ✅ done |
+| 9 | Dashboard — HTMX + Jinja2, event log with a retry button | next |
 | 10 | Ship — multi-stage Dockerfile, Helm chart, Minikube, GitHub Actions | |
 
 Phase 4 was the substance of the project; phases 1–3 were the groundwork that made it possible.
@@ -910,9 +994,8 @@ Known gaps, deliberately deferred:
 
 - **No per-tenant isolation.** Every key sees every endpoint, event and delivery. Scopes limit
   *what* a key can do, not *which rows* it can see. Multi-tenancy is not on the roadmap.
-- **No automated test suite yet.** Each phase has been verified against a live server and
-  Postgres with a scripted acceptance run, but those scripts are not committed and do not run
-  in CI. Phase 8.
+- **Nothing runs in CI yet.** The suite passes locally in both infrastructure modes; wiring it
+  to GitHub Actions is Phase 10.
 
 ---
 
@@ -926,4 +1009,5 @@ Known gaps, deliberately deferred:
 | Cache / limits | Redis 8, redis-py asyncio, Lua for atomic operations |
 | Observability | structlog, prometheus-client, OpenTelemetry |
 | Migrations | Alembic |
+| Testing | pytest, pytest-asyncio, testcontainers, k6 |
 | Tooling | uv, ruff, mypy (strict) |
