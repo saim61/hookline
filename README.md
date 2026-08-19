@@ -7,9 +7,9 @@ and a permanent audit trail of every attempt.
 A smaller, readable implementation of what [Svix](https://svix.com) and
 [Hookdeck](https://hookdeck.com) sell as a product.
 
-> **Status:** in active development. Phase 8 of 10 complete — the core works end to end, the
-> API is authenticated and observable, and there are **257 tests at 94% coverage** running
-> in 40 seconds. What remains is a dashboard and deployment. See [Roadmap](#roadmap).
+> **Status:** in active development. Phase 9 of 10 complete — the core works end to end, the
+> API is authenticated and observable, there is an operator dashboard, and **292 tests at
+> 94% coverage** run in 45 seconds. What remains is deployment. See [Roadmap](#roadmap).
 
 ---
 
@@ -134,7 +134,9 @@ The API accepts and stores events; the worker delivers them. **Without the worke
 events are ingested and queued but never sent** — deliveries just sit in `pending`, which is
 the correct behaviour and also the first thing to check when a webhook doesn't arrive.
 
-Open <http://127.0.0.1:8000/docs> for the interactive API docs.
+Open <http://127.0.0.1:8000/docs> for the API docs, or
+<http://127.0.0.1:8000/dashboard> for the operator dashboard — sign in there with the key you
+just created.
 
 Verify it's alive — the probes are deliberately unauthenticated, since a load balancer
 has no key:
@@ -598,6 +600,7 @@ file. Defaults are in [`src/hookline/config.py`](src/hookline/config.py).
 | `HOOKLINE_METRICS_ENABLED` | `true` | Serve `/metrics` |
 | `HOOKLINE_WORKER_METRICS_PORT` | `9100` | Worker's scrape port |
 | `HOOKLINE_OTEL_ENDPOINT` | *(unset)* | OTLP/HTTP collector; tracing off when unset |
+| `HOOKLINE_DASHBOARD_ENABLED` | `true` | Serve the operator UI at `/dashboard` |
 
 `MAX_DELIVERY_ATTEMPTS` is snapshotted onto each delivery at fan-out rather than read at retry
 time, so lowering it cannot retroactively dead-letter work already queued.
@@ -638,6 +641,12 @@ hookline/
     │   └── dependencies.py      # bearer auth, scope checks, inbound signatures
     ├── admin/
     │   └── __main__.py          # `hookline-admin`, bootstrap and revoke keys
+    ├── dashboard/
+    │   ├── routes.py            # pages, one handler per view
+    │   ├── session.py           # redis-backed cookie sessions
+    │   └── deps.py              # viewer resolution, csrf
+    ├── templates/               # jinja2, with partials for htmx swaps
+    ├── static/                  # one hand-written stylesheet
     ├── observability/
     │   ├── logging.py           # structlog, JSON or console
     │   ├── context.py           # request id contextvar
@@ -721,7 +730,7 @@ fails halfway leaves nothing behind for a worker to find.
 ```bash
 uv run fastapi dev src/hookline/main.py    # api, with reload
 uv run hookline-worker                     # delivery worker
-uv run pytest                              # 257 tests, ~40s
+uv run pytest                              # 292 tests, ~45s
 uv run ruff check --fix . && uv run ruff format .
 uv run mypy src                            # strict mode, must stay clean
 docker compose ps                          # db and redis should report "healthy"
@@ -767,6 +776,70 @@ constraint to the *type* rather than to the table's metadata, where autogenerate
 It then finds the constraint in the database, finds no match in the models, and emits a
 `drop_constraint` on every future migration — quietly deleting your validation. `deliveries`
 therefore uses `create_constraint=False` plus an explicit `CheckConstraint` in `__table_args__`.
+
+---
+
+## Dashboard
+
+An operator UI at <http://127.0.0.1:8000/dashboard>. Sign in with any API key.
+
+| Page | For |
+|---|---|
+| Overview | queue depth at a glance, and a warning when deliveries are piling up with nothing delivering |
+| Events | the event log, filterable by type, showing fan-out counts per event |
+| Event detail | the payload, every destination, and every attempt with its response |
+| Deliveries | deliveries by status. Defaults to the dead letter queue, with a replay button |
+| Endpoints | registered destinations and what they subscribe to |
+| API keys | names, prefixes, scopes, last used |
+
+### Server-rendered, progressively enhanced
+
+Jinja2 templates with HTMX layered on top. **Every action is a real link or a real form
+submit.** HTMX only changes how the response is applied — swapping one row instead of
+reloading the page — so with JavaScript disabled, or the CDN unreachable, the dashboard still
+works. That is the reason there is no build step, no bundler, and no second copy of the data
+model in JSON for something whose entire job is showing rows from a table.
+
+The mechanism is one line of server logic: a request carrying `HX-Request` gets a fragment,
+anything else gets the whole page wrapping the same fragment. Same handler, same context, so
+the enhanced and unenhanced paths cannot drift apart. A test asserts that every `hx-post` sits
+on a form that also has `method="post"` and an `action`, which is what stops that guarantee
+quietly rotting.
+
+### Authentication
+
+A browser cannot send `Authorization: Bearer hl_...` by following a link, so the dashboard
+trades a key for a session once, at login.
+
+**The key never reaches the browser.** Redis holds `session id -> key id`; the cookie carries
+only an opaque random id. A stolen cookie is therefore one revocable, expiring session rather
+than the credential itself — which is the whole reason this is worth 40 lines instead of just
+putting the key in the cookie.
+
+The cookie is `HttpOnly` (an XSS bug cannot read it) and `SameSite=Strict` (the browser does
+not send it cross-site at all). Set `Secure` too when you put this behind TLS; it is off by
+default so the cookie is not silently dropped over plain HTTP on localhost.
+
+The key is **re-read from the database on every request** rather than trusted from the session,
+so revoking or expiring a key logs the holder out immediately instead of at the end of an
+eight-hour session.
+
+Replay carries a CSRF token bound to the session, on top of `SameSite=Strict`. Two defences
+because the token does not depend on the browser honouring a cookie attribute, and requeuing
+someone's webhook deliveries is worth the second one.
+
+Scopes are enforced the same way as on the API. A key without `deliveries:write` gets no replay
+button **and** a `403` if it posts to the endpoint anyway — hiding a control is a courtesy, not
+authorisation.
+
+### Deliberately read-mostly
+
+The dashboard shows things and replays dead deliveries. It cannot register endpoints, mint
+keys, or ingest events. Those are API operations, and giving the same actions two
+implementations means two places for a validation rule to be wrong. Replay is the exception
+because it is the one thing a human does in response to something they just read on the page.
+
+Turn the whole thing off with `HOOKLINE_DASHBOARD_ENABLED=false` for an API-only deployment.
 
 ---
 
@@ -894,7 +967,7 @@ supposed to be measuring.
 ## Testing
 
 ```bash
-uv run pytest                      # 257 tests, ~40s
+uv run pytest                      # 292 tests, ~45s
 uv run pytest tests/unit           # no database, no network, instant
 uv run pytest --cov --cov-report=term-missing
 ```
@@ -1007,6 +1080,7 @@ Known gaps, deliberately deferred:
 | Web framework | FastAPI, Pydantic v2 |
 | Database | PostgreSQL 17, SQLAlchemy 2.0 (async), asyncpg |
 | Cache / limits | Redis 8, redis-py asyncio, Lua for atomic operations |
+| Dashboard | Jinja2 + HTMX, server-rendered, no build step |
 | Observability | structlog, prometheus-client, OpenTelemetry |
 | Migrations | Alembic |
 | Testing | pytest, pytest-asyncio, testcontainers, k6 |

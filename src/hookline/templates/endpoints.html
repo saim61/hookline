@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}Endpoints · Hookline{% endblock %}
+
+{% block content %}
+<h1>Endpoints</h1>
+<p class="muted">
+  Destination URLs registered by API callers. Signing secrets are not shown — only a
+  <code>whsec_</code> value returned once at creation ever existed outside the database.
+</p>
+
+<table>
+  <thead>
+    <tr><th>url</th><th>subscribes to</th><th>active</th><th>registered</th></tr>
+  </thead>
+  <tbody>
+    {% include "partials/endpoint_rows.html" %}
+  </tbody>
+</table>
+{% endblock %}

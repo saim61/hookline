@@ -1,0 +1,70 @@
+{% extends "base.html" %}
+{% block title %}{{ event.event_type }} · Hookline{% endblock %}
+
+{% block content %}
+<p class="muted small"><a href="/dashboard/events">← event log</a></p>
+<h1><code>{{ event.event_type }}</code></h1>
+
+<dl class="facts">
+  <dt>id</dt><dd><code>{{ event.id }}</code></dd>
+  <dt>ingested</dt><dd>{{ event.created_at.strftime('%Y-%m-%d %H:%M:%S %Z') }}</dd>
+  <dt>idempotency key</dt><dd>{{ event.idempotency_key or '—' }}</dd>
+</dl>
+
+<h2>Payload</h2>
+<pre class="payload">{{ payload_json }}</pre>
+
+<h2>Deliveries</h2>
+{% if not rows %}
+  <p class="muted">
+    No deliveries. No active endpoint was subscribed to <code>{{ event.event_type }}</code>
+    when this event was ingested — the event was accepted and stored, and nobody was listening.
+  </p>
+{% endif %}
+
+{% for row in rows %}
+  <div class="delivery">
+    <div class="delivery-head">
+      <span class="pill {{ {'delivered': 'good', 'dead': 'bad', 'failed': 'warn'}.get(row.delivery.status, '') }}">
+        {{ row.delivery.status }}
+      </span>
+      <code class="url">{{ row.url }}</code>
+      <span class="muted small">
+        attempt {{ row.delivery.attempt_count }} of {{ row.delivery.max_attempts }}
+      </span>
+    </div>
+
+    {% if row.delivery.last_error %}
+      <p class="error small">{{ row.delivery.last_error }}</p>
+    {% endif %}
+
+    {% if row.attempts %}
+      <table class="attempts">
+        <thead>
+          <tr><th>#</th><th>when</th><th>status</th><th>took</th><th>response</th></tr>
+        </thead>
+        <tbody>
+        {% for attempt in row.attempts %}
+          <tr>
+            <td>{{ attempt.attempt_number }}</td>
+            <td class="muted">{{ attempt.created_at.strftime('%H:%M:%S') }}</td>
+            <td>
+              {% if attempt.status_code %}
+                <code class="{{ 'good' if attempt.status_code < 300 else 'bad' }}">{{ attempt.status_code }}</code>
+              {% else %}
+                {# No response arrived at all: DNS failure, refused connection, timeout. #}
+                <span class="pill bad">no response</span>
+              {% endif %}
+            </td>
+            <td class="muted">{{ attempt.duration_ms }}ms</td>
+            <td class="muted small truncate">{{ attempt.error or attempt.response_body or '—' }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="muted small">Not attempted yet.</p>
+    {% endif %}
+  </div>
+{% endfor %}
+{% endblock %}

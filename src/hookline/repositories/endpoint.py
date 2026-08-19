@@ -1,7 +1,7 @@
 import secrets
 from uuid import UUID
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from hookline.models.endpoint import Endpoint
@@ -48,6 +48,10 @@ class EndpointRepository:
             .order_by(Endpoint.created_at)
         )
         return list(result.scalars().all())
+
+    async def count(self) -> int:
+        result = await self._session.execute(select(func.count()).select_from(Endpoint))
+        return int(result.scalar_one())
 
     async def delete(self, endpoint_id: UUID) -> list[str] | None:
         """Delete an endpoint, returning the event types it was subscribed to.

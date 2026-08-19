@@ -1,10 +1,12 @@
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from hookline.enums import DeliveryStatus
+from hookline.models.delivery import Delivery
 from hookline.models.event import Event
 
 
@@ -67,3 +69,37 @@ class EventRepository:
             select(Event).order_by(Event.created_at.desc(), Event.id).limit(limit).offset(offset)
         )
         return list(result.scalars().all())
+
+    async def count(self) -> int:
+        result = await self._session.execute(select(func.count()).select_from(Event))
+        return int(result.scalar_one())
+
+    async def list_recent_with_summary(
+        self, limit: int = 50, offset: int = 0, event_type: str | None = None
+    ) -> list[tuple[Event, int, int, int]]:
+        """Events with (total, delivered, dead) delivery counts, in one query.
+
+        Aggregated with a LEFT JOIN and FILTER rather than by looping over events and
+        counting per row. Fifty events would otherwise be fifty-one queries, and the
+        counts are the only reason the dashboard needs deliveries at all on this page.
+
+        LEFT, not INNER: an event with no subscribers must still appear, showing 0 - that
+        is exactly the case an operator is looking for when a webhook never arrived.
+        """
+        stmt = (
+            select(
+                Event,
+                func.count(Delivery.id),
+                func.count(Delivery.id).filter(Delivery.status == DeliveryStatus.DELIVERED),
+                func.count(Delivery.id).filter(Delivery.status == DeliveryStatus.DEAD),
+            )
+            .outerjoin(Delivery, Delivery.event_id == Event.id)
+            .group_by(Event.id)
+            .order_by(Event.created_at.desc(), Event.id)
+            .limit(limit)
+            .offset(offset)
+        )
+        if event_type:
+            stmt = stmt.where(Event.event_type == event_type)
+        rows = await self._session.execute(stmt)
+        return [(event, total, delivered, dead) for event, total, delivered, dead in rows]

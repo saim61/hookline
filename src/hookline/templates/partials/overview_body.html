@@ -1,0 +1,68 @@
+<div id="overview" hx-get="/dashboard" hx-trigger="every 10s" hx-swap="outerHTML">
+  <h1>Overview</h1>
+
+  <div class="tiles">
+    <a class="tile" href="/dashboard/events">
+      <span class="n">{{ totals.events }}</span><span class="l">events</span>
+    </a>
+    <a class="tile" href="/dashboard/endpoints">
+      <span class="n">{{ totals.endpoints }}</span><span class="l">endpoints</span>
+    </a>
+    <a class="tile" href="/dashboard/deliveries?status=pending">
+      <span class="n">{{ counts.pending }}</span><span class="l">pending</span>
+    </a>
+    <a class="tile" href="/dashboard/deliveries?status=in_flight">
+      <span class="n">{{ counts.in_flight }}</span><span class="l">in flight</span>
+    </a>
+    <a class="tile good" href="/dashboard/deliveries?status=delivered">
+      <span class="n">{{ counts.delivered }}</span><span class="l">delivered</span>
+    </a>
+    <a class="tile bad" href="/dashboard/deliveries?status=dead">
+      <span class="n">{{ counts.dead }}</span><span class="l">dead letter</span>
+    </a>
+  </div>
+
+  {% if counts.dead %}
+    <p class="banner bad">
+      {{ counts.dead }} deliver{{ 'y' if counts.dead == 1 else 'ies' }} gave up.
+      <a href="/dashboard/deliveries?status=dead">Work through the dead letter queue</a>.
+    </p>
+  {% endif %}
+
+  {% if counts.pending and not counts.delivered %}
+    <p class="banner warn">
+      Deliveries are queued but nothing has been delivered. Is the worker running?
+      <code>uv run hookline-worker</code>
+    </p>
+  {% endif %}
+
+  <h2>Recent events</h2>
+  {% if recent %}
+    <table>
+      <thead>
+        <tr><th>type</th><th>when</th><th>fan-out</th><th></th></tr>
+      </thead>
+      <tbody>
+      {% for event, total, delivered, dead in recent %}
+        <tr>
+          <td><code>{{ event.event_type }}</code></td>
+          <td class="muted">{{ event.created_at.strftime('%Y-%m-%d %H:%M:%S') }}</td>
+          <td>
+            {% if total == 0 %}
+              <span class="pill muted" title="no active endpoint is subscribed to this type">
+                no subscribers
+              </span>
+            {% else %}
+              <span class="pill good">{{ delivered }}/{{ total }} delivered</span>
+              {% if dead %}<span class="pill bad">{{ dead }} dead</span>{% endif %}
+            {% endif %}
+          </td>
+          <td><a href="/dashboard/events/{{ event.id }}">inspect</a></td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p class="muted">No events yet. Ingest one with <code>POST /api/v1/events</code>.</p>
+  {% endif %}
+</div>

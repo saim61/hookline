@@ -49,6 +49,11 @@ class Settings(BaseSettings):
     # independently.
     circuit_breaker_backend: Literal["redis", "memory"] = "redis"
 
+    # --- dashboard --------------------------------------------------------------
+    # Server-rendered operator UI at /dashboard. Turn it off for an API-only deployment:
+    # fewer routes reachable is fewer routes to reason about.
+    dashboard_enabled: bool = True
+
     # --- observability ----------------------------------------------------------
     # /metrics on the API. Left open like the health probes: Prometheus scrapes with no
     # credential, and in a cluster the port is not routed publicly anyway.

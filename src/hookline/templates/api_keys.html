@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}API keys · Hookline{% endblock %}
+
+{% block content %}
+<h1>API keys</h1>
+<p class="muted">
+  Only a SHA-256 of each key is stored, so none of them can be shown here. The
+  <code>prefix</code> column is what identifies a key in a log line.
+</p>
+
+<table>
+  <thead>
+    <tr><th>name</th><th>prefix</th><th>scopes</th><th>state</th><th>last used</th></tr>
+  </thead>
+  <tbody>
+    {% include "partials/api_key_rows.html" %}
+  </tbody>
+</table>
+
+<p class="muted small">
+  Create with <code>POST /api/v1/api-keys</code> or
+  <code>uv run hookline-admin create-key</code>. Revoke with
+  <code>POST /api/v1/api-keys/{id}/revoke</code>.
+</p>
+{% endblock %}

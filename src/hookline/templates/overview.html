@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block title %}Overview · Hookline{% endblock %}
+
+{% block content %}
+{#
+  Polls itself every 10s via HTMX, swapping only the body. Without JavaScript this is a
+  static snapshot and the browser's reload button does the same job - which is why the
+  refresh is an enhancement rather than the mechanism.
+#}
+<div id="overview" hx-get="/dashboard" hx-trigger="every 10s" hx-swap="outerHTML">
+  {% include "partials/overview_body.html" %}
+</div>
+{% endblock %}

@@ -1,0 +1,19 @@
+{#
+  Offset pagination, which is the honest choice for a dashboard: an operator wants page
+  numbers, and the tables are small enough that a deep OFFSET is not a problem. A keyset
+  cursor would be faster at a million rows and much worse to use here.
+#}
+<nav class="pager">
+  {% set base = request.url.path %}
+  {% if offset > 0 %}
+    <a href="{{ base }}?limit={{ limit }}&offset={{ [offset - limit, 0] | max }}">← newer</a>
+  {% else %}
+    <span class="muted">← newer</span>
+  {% endif %}
+  <span class="muted small">showing {{ rows | length }} from {{ offset }}</span>
+  {% if rows | length == limit %}
+    <a href="{{ base }}?limit={{ limit }}&offset={{ offset + limit }}">older →</a>
+  {% else %}
+    <span class="muted">older →</span>
+  {% endif %}
+</nav>

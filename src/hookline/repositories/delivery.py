@@ -275,6 +275,45 @@ class DeliveryRepository:
         )
         return list(result.scalars().all())
 
+    async def count_by_status(self) -> dict[str, int]:
+        """One grouped query rather than five counts. Every known status is present, with
+        zero where there are no rows, so a template never has to guard on a missing key."""
+        rows = await self._session.execute(
+            select(Delivery.status, func.count()).group_by(Delivery.status)
+        )
+        counts = {str(status): int(count) for status, count in rows}
+        return {member.value: counts.get(member.value, 0) for member in DeliveryStatus}
+
+    async def list_with_endpoint(
+        self, status: DeliveryStatus | None, limit: int = 50, offset: int = 0
+    ) -> list[tuple[Delivery, str]]:
+        """Deliveries with the destination URL, joined rather than looked up per row.
+
+        A dashboard listing 50 deliveries and then fetching each endpoint would be 51
+        queries for one page - the N+1 that ORMs are famous for. The URL is the only
+        endpoint field the table shows, so a join is all that is needed.
+        """
+        stmt = (
+            select(Delivery, Endpoint.url)
+            .join(Endpoint, Delivery.endpoint_id == Endpoint.id)
+            .order_by(Delivery.updated_at.desc(), Delivery.id)
+            .limit(limit)
+            .offset(offset)
+        )
+        if status is not None:
+            stmt = stmt.where(Delivery.status == status)
+        rows = await self._session.execute(stmt)
+        return [(delivery, url) for delivery, url in rows]
+
+    async def latest_attempt(self, delivery_id: UUID) -> DeliveryAttempt | None:
+        result = await self._session.execute(
+            select(DeliveryAttempt)
+            .where(DeliveryAttempt.delivery_id == delivery_id)
+            .order_by(DeliveryAttempt.attempt_number.desc())
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+
     async def list_attempts(self, delivery_id: UUID) -> list[DeliveryAttempt]:
         result = await self._session.execute(
             select(DeliveryAttempt)

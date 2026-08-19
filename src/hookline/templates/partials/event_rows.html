@@ -1,0 +1,18 @@
+{% for event, total, delivered, dead in rows %}
+  <tr>
+    <td><code>{{ event.event_type }}</code></td>
+    <td class="muted">{{ event.created_at.strftime('%Y-%m-%d %H:%M:%S') }}</td>
+    <td>
+      {% if total == 0 %}
+        <span class="pill muted">no subscribers</span>
+      {% else %}
+        <span class="pill good">{{ delivered }}/{{ total }}</span>
+        {% if dead %}<span class="pill bad">{{ dead }} dead</span>{% endif %}
+      {% endif %}
+    </td>
+    <td class="muted small">{{ event.idempotency_key or '—' }}</td>
+    <td><a href="/dashboard/events/{{ event.id }}">inspect</a></td>
+  </tr>
+{% else %}
+  <tr><td colspan="5" class="muted">Nothing matches.</td></tr>
+{% endfor %}

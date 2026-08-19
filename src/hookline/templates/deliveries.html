@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block title %}Deliveries · Hookline{% endblock %}
+
+{% block content %}
+<h1>
+  {% if status == 'dead' %}Dead letter queue{% else %}Deliveries{% endif %}
+</h1>
+
+{% if status == 'dead' %}
+  <p class="muted">
+    Deliveries that exhausted their attempt budget or hit a response that will not change.
+    Replay requeues one with a fresh budget; earlier attempts stay in its history.
+  </p>
+{% endif %}
+
+<nav class="tabs">
+  {% for s in statuses %}
+    <a href="/dashboard/deliveries?status={{ s }}" class="{{ 'on' if status == s }}">
+      {{ s }}{% if s != 'all' %} <span class="muted">{{ counts[s] }}</span>{% endif %}
+    </a>
+  {% endfor %}
+</nav>
+
+<table>
+  <thead>
+    <tr>
+      <th>status</th><th>destination</th><th>attempts</th>
+      <th>next try</th><th>last result</th><th></th>
+    </tr>
+  </thead>
+  <tbody>
+    {% include "partials/delivery_rows.html" %}
+  </tbody>
+</table>
+
+{% include "partials/pager.html" %}
+{% endblock %}

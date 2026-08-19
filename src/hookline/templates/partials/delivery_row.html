@@ -1,0 +1,44 @@
+{#
+  One row, included both by the list and by the replay handler's HTMX response, so a
+  replayed row re-renders through exactly the same markup as a freshly loaded one.
+#}
+<tr id="delivery-{{ row.delivery.id }}" class="{{ 'flash' if just_replayed }}">
+  <td>
+    <span class="pill {{ {'delivered': 'good', 'dead': 'bad', 'failed': 'warn', 'in_flight': 'warn'}.get(row.delivery.status, '') }}">
+      {{ row.delivery.status }}
+    </span>
+  </td>
+  <td class="truncate"><code class="url">{{ row.url }}</code></td>
+  <td>{{ row.delivery.attempt_count }} / {{ row.delivery.max_attempts }}</td>
+  <td class="muted small">{{ row.delivery.next_attempt_at.strftime('%H:%M:%S') }}</td>
+  <td class="muted small truncate">
+    {% if row.last_attempt %}
+      {% if row.last_attempt.status_code %}
+        <code>{{ row.last_attempt.status_code }}</code>
+      {% else %}
+        no response
+      {% endif %}
+      {{ row.last_attempt.error or '' }}
+    {% else %}
+      —
+    {% endif %}
+  </td>
+  <td>
+    {% if row.delivery.status == 'dead' and can_replay %}
+      {#
+        A real form, so this works with JavaScript disabled - it just redirects back to the
+        list instead of swapping the row. hx-* only changes how the response is applied.
+      #}
+      <form method="post"
+            action="/dashboard/deliveries/{{ row.delivery.id }}/replay"
+            hx-post="/dashboard/deliveries/{{ row.delivery.id }}/replay"
+            hx-target="#delivery-{{ row.delivery.id }}"
+            hx-swap="outerHTML">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit">Replay</button>
+      </form>
+    {% elif just_replayed %}
+      <span class="pill good">requeued</span>
+    {% endif %}
+  </td>
+</tr>

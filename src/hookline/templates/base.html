@@ -1,0 +1,50 @@
+{#
+  Layout for every dashboard page.
+
+  HTMX is loaded from a CDN, but nothing depends on it: every action here is a real link or
+  a real form submit, so with no JavaScript the dashboard still works - it just reloads the
+  page instead of swapping a fragment. That is the reason there is no build step and no
+  second copy of the data model in JSON.
+#}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Hookline{% endblock %}</title>
+  <link rel="stylesheet" href="/static/dashboard.css">
+  <script src="https://unpkg.com/htmx.org@2.0.4" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/dashboard">hookline</a>
+    <nav>
+      <a href="/dashboard" class="{{ 'on' if active == 'overview' }}">Overview</a>
+      <a href="/dashboard/events" class="{{ 'on' if active == 'events' }}">Events</a>
+      <a href="/dashboard/deliveries" class="{{ 'on' if active == 'deliveries' }}">Deliveries</a>
+      <a href="/dashboard/endpoints" class="{{ 'on' if active == 'endpoints' }}">Endpoints</a>
+      {% if principal and principal.can('admin') %}
+        <a href="/dashboard/api-keys" class="{{ 'on' if active == 'api-keys' }}">API keys</a>
+      {% endif %}
+    </nav>
+    <div class="who">
+      {% if principal %}
+        <span title="the key this session is using">{{ principal.name }}</span>
+        <form method="post" action="/dashboard/logout">
+          <button type="submit" class="link">Sign out</button>
+        </form>
+      {% endif %}
+    </div>
+  </header>
+
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+
+  <footer>
+    <a href="/docs">API docs</a> ·
+    <a href="/metrics">metrics</a> ·
+    <a href="/ready">readiness</a>
+  </footer>
+</body>
+</html>

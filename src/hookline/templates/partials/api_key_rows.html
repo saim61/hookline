@@ -1,0 +1,20 @@
+{% for key in rows %}
+  <tr>
+    <td>{{ key.name }}</td>
+    <td><code>{{ key.display_prefix }}…</code></td>
+    <td>{% for s in key.scopes %}<code class="tag">{{ s }}</code>{% endfor %}</td>
+    <td>
+      {% if not key.is_active %}<span class="pill muted">revoked</span>
+      {% elif key.expires_at and key.expires_at < now() %}<span class="pill warn">expired</span>
+      {% else %}<span class="pill good">active</span>{% endif %}
+      {% if key.signed_requests_required %}
+        <span class="pill" title="requests with this key must carry a valid signature">signed</span>
+      {% endif %}
+    </td>
+    <td class="muted small">
+      {{ key.last_used_at.strftime('%Y-%m-%d %H:%M') if key.last_used_at else 'never' }}
+    </td>
+  </tr>
+{% else %}
+  <tr><td colspan="5" class="muted">No keys.</td></tr>
+{% endfor %}
