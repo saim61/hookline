@@ -7,9 +7,11 @@ and a permanent audit trail of every attempt.
 A smaller, readable implementation of what [Svix](https://svix.com) and
 [Hookdeck](https://hookdeck.com) sell as a product.
 
-> **Status:** in active development. Phase 9 of 10 complete — the core works end to end, the
-> API is authenticated and observable, there is an operator dashboard, and **292 tests at
-> 94% coverage** run in 45 seconds. What remains is deployment. See [Roadmap](#roadmap).
+> **Status:** all ten phases complete. Events are accepted, deduplicated, fanned out, signed,
+> delivered with retries and backoff, rate limited in both directions, and dead-lettered when
+> an endpoint stays down — with an authenticated API, an operator dashboard, JSON logs and
+> Prometheus metrics, **292 tests at 94% coverage**, and a Helm chart verified on Minikube.
+> See [Roadmap](#roadmap) for what each phase covered.
 
 ---
 
@@ -624,6 +626,10 @@ hookline/
 ├── pyproject.toml               # deps + ruff/mypy config
 ├── uv.lock                      # committed, pinned dependency graph
 ├── alembic.ini
+├── Dockerfile                   # multi-stage, non-root, one image for all three processes
+├── deploy/
+│   └── helm/hookline/           # api + worker deployments, migration hook, probes
+├── .github/workflows/           # lint, test, image build + boot, helm render
 ├── tests/
 │   ├── unit/                     # no database, no network, no sleeping
 │   ├── integration/              # real postgres, real redis, fake receiver
@@ -1044,6 +1050,65 @@ depth, something has coupled ingest to delivery, which is the whole point of the
 
 ---
 
+## Running it for real
+
+Three processes from one image, differing only by their command: the API, the worker, and a
+migration job. Full detail in [deploy/README.md](deploy/README.md); the short version:
+
+```bash
+docker compose up -d                                          # whole stack
+docker compose exec api hookline-admin create-key --name local
+```
+
+```bash
+helm upgrade --install hookline deploy/helm/hookline -n hookline --create-namespace \
+  --set image.tag=v0.1.0 --set secrets.existingSecret=hookline-credentials
+```
+
+The chart declares **no** Postgres or Redis dependency. Bundling them as subcharts makes a chart
+that is easy to demo and wrong to run — a database managed by the same release as the
+application gets deleted along with it.
+
+Three deployment decisions that are more interesting than the YAML:
+
+**Migrations are a Helm `pre-upgrade` hook**, not an init container (those run once per pod, so
+three replicas race three `alembic upgrade` processes on the version table) and not a
+post-install hook (with `--wait`, Helm waits for pods that are waiting for the schema — that
+deadlocks). Readiness cannot cover for it either: `/ready` runs `select 1`, which succeeds
+against an empty schema.
+
+**Workers scale on queue age, not CPU.** A worker waiting on a slow customer endpoint uses
+almost no CPU, so a CPU-based HPA barely reacts to the thing that matters. The signal is
+`max(hookline_oldest_pending_delivery_age_seconds)`; add replicas and they coordinate through
+Postgres with `SKIP LOCKED`, needing no configuration and no leader election.
+
+**Both Deployments carry a `checksum/config` annotation.** Kubernetes restarts nothing when a
+ConfigMap changes, and environment variables are read once at startup — without it a config
+change appears to apply and quietly does nothing.
+
+Verified on Minikube, not just rendered: all four migrations applied from an empty database, a
+`helm upgrade` re-ran the hook as a no-op and rolled the pods with the new config, and **two
+worker pods claimed disjoint batches** — six events split 1 and 5, no duplicate delivery. That
+last one is `SKIP LOCKED` working across separate processes, which no single-process test can
+show.
+
+### CI
+
+Four jobs on every push and pull request: lint (ruff, format, mypy), tests against Postgres and
+Redis service containers, a Docker build, and a Helm render.
+
+Two of those do more than the name suggests. The image job **boots the container** and waits for
+`/health`, which catches a missing template directory or an entrypoint that is not on `PATH` —
+things a successful build cannot detect. It then asserts `/ready` returns 503 with no database,
+which is a regression test for the probe split: if `/health` ever starts touching Postgres,
+every replica restarts together during the next blip, and this is the check that notices. The
+Helm job renders with defaults *and* with every optional feature enabled, because the ingress,
+HPA and ServiceMonitor templates are never parsed while their feature is off, then validates the
+output with `kubeconform` — `helm template` only proves the Go templates render, not that the
+result is a valid Kubernetes object.
+
+---
+
 ## Roadmap
 
 | Phase | Scope | Status |
@@ -1060,15 +1125,21 @@ depth, something has coupled ingest to delivery, which is the whole point of the
 | 9 | Dashboard — HTMX + Jinja2, event log with a retry button | next |
 | 10 | Ship — multi-stage Dockerfile, Helm chart, Minikube, GitHub Actions | |
 
-Phase 4 was the substance of the project; phases 1–3 were the groundwork that made it possible.
-Everything after it is hardening rather than new capability.
+Phase 4 was the substance of the project; phases 1–3 were the groundwork that made it possible,
+and 5–10 are hardening rather than new capability.
+
+Optional Phase 11, if this turns toward AI systems work: pgvector semantic search over event
+payloads.
 
 Known gaps, deliberately deferred:
 
 - **No per-tenant isolation.** Every key sees every endpoint, event and delivery. Scopes limit
   *what* a key can do, not *which rows* it can see. Multi-tenancy is not on the roadmap.
-- **Nothing runs in CI yet.** The suite passes locally in both infrastructure modes; wiring it
-  to GitHub Actions is Phase 10.
+- **The CI workflows have never run.** They are written against GitHub Actions and were checked
+  by hand locally — lint, tests, the Docker build and boot, `helm lint`, and both `helm
+  template` renders — but no push has exercised them on a real runner.
+- **No horizontal scaling signal for the worker out of the box.** The chart ships a CPU-based
+  HPA, which is a poor proxy; the honest metric needs a custom-metrics adapter or KEDA.
 
 ---
 
@@ -1085,3 +1156,4 @@ Known gaps, deliberately deferred:
 | Migrations | Alembic |
 | Testing | pytest, pytest-asyncio, testcontainers, k6 |
 | Tooling | uv, ruff, mypy (strict) |
+| Deployment | Docker, Compose, Helm, GitHub Actions |

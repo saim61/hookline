@@ -1,0 +1,51 @@
+{{- if .Values.serviceMonitor.enabled }}
+{{/*
+Prometheus Operator scrape config. Two ServiceMonitors, because the API and the worker are two
+processes with two independent sets of counters - one per port.
+
+Off by default: the CRD only exists on a cluster running the Prometheus Operator, and a chart
+that fails to install on a cluster without it is a chart that cannot be demoed.
+
+Remember when writing alerts on these: `hookline_deliveries` and
+`hookline_oldest_pending_delivery_age_seconds` describe the *table*, so every replica reports the
+same value. Aggregate with `max()`, never `sum()` - summing across three replicas turns a queue
+of 40 into a graph showing 120.
+*/}}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "hookline.fullname" . }}-api
+  labels:
+    {{- include "hookline.labels" . | nindent 4 }}
+    {{- with .Values.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "hookline.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: api
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: {{ .Values.serviceMonitor.interval }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "hookline.fullname" . }}-worker
+  labels:
+    {{- include "hookline.labels" . | nindent 4 }}
+    {{- with .Values.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "hookline.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: worker
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: {{ .Values.serviceMonitor.interval }}
+{{- end }}

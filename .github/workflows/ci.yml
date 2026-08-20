@@ -1,0 +1,176 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same branch. Pushing three commits in a minute should not
+# occupy three runners proving the first two are irrelevant.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UV_FROZEN: "1"
+
+jobs:
+  # Split from `test` so a formatting mistake fails in twenty seconds instead of after
+  # Postgres has finished starting. It also makes the failure obvious from the job name alone.
+  lint:
+    name: lint and types
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      # --frozen: fail if uv.lock disagrees with pyproject.toml, rather than resolving
+      # something no test has ever run against.
+      - run: uv sync --frozen --all-groups
+
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run mypy src
+
+  test:
+    name: tests
+    runs-on: ubuntu-latest
+
+    # Service containers rather than testcontainers here: GitHub already gives us managed
+    # sidecars with health gating, so starting Docker-in-Docker to do the same thing would
+    # only be slower. The testcontainers path stays available for anyone running the suite
+    # somewhere without them.
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: hookline
+          POSTGRES_PASSWORD: hookline
+          POSTGRES_DB: hookline
+        ports: ["5432:5432"]
+        # Without this the suite starts connecting before Postgres accepts connections, and
+        # the first test fails for a reason that has nothing to do with the code.
+        options: >-
+          --health-cmd "pg_isready -U hookline"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      redis:
+        image: redis:8-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - run: uv sync --frozen --all-groups
+
+      - name: Run the suite
+        env:
+          # A dedicated database, created by the suite's own session fixture. The dev
+          # database convention is kept even in CI so the two paths do not diverge.
+          HOOKLINE_TEST_DATABASE_URL: postgresql+asyncpg://hookline:hookline@localhost:5432/hookline_test
+          HOOKLINE_TEST_REDIS_URL: redis://localhost:6379/15
+        run: uv run pytest --cov --cov-report=xml --cov-report=term
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: coverage.xml
+          if-no-files-found: warn
+
+  # A build on every PR, so a Dockerfile mistake is caught by the people who made it rather
+  # than at release time. Nothing is pushed - see release.yml for that.
+  image:
+    name: docker build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: hookline:ci
+          # GitHub Actions cache, so an unchanged dependency layer is not rebuilt on every PR.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: The image starts and answers its probes
+        # A build that produces an image which cannot boot has proved almost nothing. This
+        # runs the real thing and waits for /health, which also catches a missing template
+        # directory or an entrypoint that is not on PATH.
+        run: |
+          docker run -d --name hookline-ci -p 8000:8000 \
+            -e HOOKLINE_DATABASE_URL=postgresql+asyncpg://nobody@127.0.0.1:1/none \
+            hookline:ci
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8000/health >/dev/null 2>&1; then
+              echo "the api is up"
+              break
+            fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8000/health
+          # /health must succeed with no database at all - it is a liveness probe. If this
+          # fails, the probe is touching Postgres and every replica will restart together
+          # during the next database blip.
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/ready)" = "503"
+          echo "readiness correctly reports 503 without a database"
+          docker rm -f hookline-ci
+
+  helm:
+    name: helm chart
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+
+      - run: helm lint deploy/helm/hookline
+
+      # Render with the defaults and with everything switched on. The second catches
+      # templates that only parse while their feature is disabled - the ingress, HPA and
+      # ServiceMonitor blocks are never exercised otherwise.
+      - name: Render with defaults
+        run: helm template hookline deploy/helm/hookline > /dev/null
+
+      - name: Render with every optional feature enabled
+        run: |
+          helm template hookline deploy/helm/hookline \
+            --set api.ingress.enabled=true \
+            --set api.ingress.tls.enabled=true \
+            --set api.autoscaling.enabled=true \
+            --set worker.autoscaling.enabled=true \
+            --set serviceMonitor.enabled=true \
+            --set secrets.existingSecret=hookline-external \
+            > /dev/null
+
+      - name: The rendered manifests are valid Kubernetes objects
+        # helm template only proves the Go templates render. This checks the result against
+        # real API schemas, which catches a misspelled field that YAML is perfectly happy with.
+        run: |
+          helm template hookline deploy/helm/hookline \
+            --set api.ingress.enabled=true \
+            --set api.autoscaling.enabled=true > /tmp/rendered.yaml
+          curl -sSL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz \
+            | tar xz -C /tmp kubeconform
+          /tmp/kubeconform -summary -strict -ignore-missing-schemas /tmp/rendered.yaml

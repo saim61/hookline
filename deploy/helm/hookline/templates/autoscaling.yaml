@@ -1,0 +1,86 @@
+{{/*
+Horizontal autoscalers, off by default.
+
+Worth being honest about what CPU-based autoscaling can and cannot do here. For the API it is
+reasonable: request handling is roughly CPU-bound once Postgres is keeping up.
+
+For the **worker** it is a poor proxy. A worker waiting on a slow customer endpoint uses almost
+no CPU, so the metric that matters - deliveries falling behind - barely moves it. The honest
+signal is `hookline_oldest_pending_delivery_age_seconds`, which needs a custom or external
+metrics adapter. Until that exists, scale workers on that metric by hand or with a KEDA
+ScaledObject; CPU-based scaling is here because it is better than nothing, not because it is
+right.
+*/}}
+{{- if .Values.api.autoscaling.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "hookline.fullname" . }}-api
+  labels:
+    {{- include "hookline.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "hookline.fullname" . }}-api
+  minReplicas: {{ .Values.api.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.api.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.api.autoscaling.targetCPUUtilizationPercentage }}
+{{- end }}
+{{- if .Values.worker.autoscaling.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "hookline.fullname" . }}-worker
+  labels:
+    {{- include "hookline.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "hookline.fullname" . }}-worker
+  minReplicas: {{ .Values.worker.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.worker.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.worker.autoscaling.targetCPUUtilizationPercentage }}
+  behavior:
+    scaleDown:
+      {{/* Slow to scale down: a worker removed mid-batch leaves rows in_flight for the reaper.
+           Cheap to keep one extra worker, annoying to churn them. */}}
+      stabilizationWindowSeconds: 300
+{{- end }}
+{{- if .Values.api.podDisruptionBudget.enabled }}
+---
+{{/*
+Keeps a voluntary disruption - a node drain, a cluster upgrade - from taking every API replica
+at once. Nothing here for the worker: losing every worker briefly delays deliveries, and the
+outbox means nothing is lost, so a PDB would block node drains for no real benefit.
+*/}}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "hookline.fullname" . }}-api
+  labels:
+    {{- include "hookline.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  minAvailable: {{ .Values.api.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "hookline.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: api
+{{- end }}

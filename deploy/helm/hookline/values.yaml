@@ -1,0 +1,173 @@
+# Defaults are sized for a small production deployment, not for a demo. Where a value could
+# reasonably be either, the comment says which way to move it and why.
+
+image:
+  repository: hookline
+  # Empty means "use the chart's appVersion". Set it explicitly in CI so a deploy pins an
+  # immutable build; `latest` makes a rollback impossible to reason about.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# ---------------------------------------------------------------- api
+
+api:
+  # Two, so a rolling update and a node drain both have somewhere to send traffic.
+  replicaCount: 2
+  resources:
+    requests:
+      cpu: 100m
+      memory: 192Mi
+    limits:
+      # No CPU limit. Throttling an async service adds tail latency to every request that
+      # happens to be in flight when the quota runs out; the request is what bounds
+      # scheduling. A memory limit is different - it is the only thing standing between a
+      # leak and the whole node.
+      memory: 512Mi
+
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+
+  service:
+    type: ClusterIP
+    port: 80
+
+  ingress:
+    enabled: false
+    className: nginx
+    annotations: {}
+    host: hookline.example.com
+    tls:
+      enabled: false
+      secretName: hookline-tls
+
+  # Keeps a voluntary disruption - a node drain, a cluster upgrade - from taking every
+  # replica at once.
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+
+# ---------------------------------------------------------------- worker
+
+worker:
+  # Workers scale on how slow customer endpoints are, not on request rate, which is the whole
+  # reason this is a separate Deployment. Watch
+  # `max(hookline_oldest_pending_delivery_age_seconds)` and add replicas when it grows -
+  # they coordinate through Postgres with SKIP LOCKED, so scaling out needs no config change.
+  replicaCount: 2
+  resources:
+    requests:
+      cpu: 100m
+      memory: 192Mi
+    limits:
+      memory: 512Mi
+
+  # Must exceed the longest a batch can take: worker_batch_size × delivery_timeout in the
+  # worst case. Too short and SIGKILL arrives mid-batch, stranding rows in_flight until the
+  # reaper picks them up minutes later.
+  terminationGracePeriodSeconds: 60
+
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 20
+    targetCPUUtilizationPercentage: 70
+
+# ---------------------------------------------------------------- migrations
+
+migrations:
+  # A Helm hook Job, run before the new pods roll out. Not an init container: an init
+  # container runs once per pod, so three replicas would race three `alembic upgrade`
+  # processes on the version table.
+  enabled: true
+  # Kept after success so `kubectl logs` can answer "what did that upgrade actually do".
+  # Deleted before the next run rather than after this one.
+  backoffLimit: 2
+  activeDeadlineSeconds: 300
+
+# ---------------------------------------------------------------- configuration
+
+config:
+  logLevelDebug: false
+  authEnabled: true
+  dashboardEnabled: true
+  metricsEnabled: true
+
+  maxDeliveryAttempts: 5
+  deliveryTimeoutSeconds: 10.0
+
+  workerPollIntervalSeconds: 1.0
+  workerBatchSize: 20
+  # Comfortably above deliveryTimeoutSeconds. Set it below and the reaper reclaims rows a
+  # healthy worker is still sending, and the customer gets the webhook twice.
+  staleDeliveryTimeoutSeconds: 300.0
+
+  retryBaseDelaySeconds: 10.0
+  retryMaxDelaySeconds: 3600.0
+
+  circuitBreakerFailureThreshold: 5
+  circuitBreakerCooldownSeconds: 60.0
+  # "redis" so every worker shares one view of an endpoint's health. With "memory" each
+  # replica has to learn independently, so a dead endpoint absorbs N × threshold failures.
+  circuitBreakerBackend: redis
+
+  rateLimitEnabled: true
+  rateLimitCapacity: 100
+  rateLimitRefillPerSecond: 20.0
+
+  deliveryRateLimitEnabled: true
+  deliveryRateLimitCapacity: 20
+  deliveryRateLimitPerSecond: 10.0
+
+  subscriberCacheTtlSeconds: 30
+
+  # OTLP/HTTP collector. Tracing stays off while this is empty.
+  otelEndpoint: ""
+
+# ---------------------------------------------------------------- secrets
+
+# Connection strings contain credentials, so they live in a Secret rather than the ConfigMap.
+#
+# Prefer `existingSecret` in anything real: values passed here end up in the Helm release
+# object, in shell history, and in whatever CI logs the command. The inline fields exist so
+# `helm install` works on Minikube without extra steps.
+secrets:
+  existingSecret: ""
+  databaseUrl: postgresql+asyncpg://hookline:hookline@hookline-postgresql:5432/hookline
+  redisUrl: redis://hookline-redis-master:6379/0
+
+# ---------------------------------------------------------------- observability
+
+serviceMonitor:
+  # Needs the Prometheus Operator CRDs. Off by default so `helm install` does not fail on a
+  # cluster that has never heard of a ServiceMonitor.
+  enabled: false
+  interval: 15s
+  labels: {}
+
+# ---------------------------------------------------------------- scheduling
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}

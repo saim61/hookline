@@ -1,0 +1,45 @@
+{{- if .Values.api.ingress.enabled }}
+{{/*
+Only the API is exposed. Two things deliberately are not:
+
+  /metrics   scraped in-cluster by Prometheus, which needs no ingress. Exposing it publicly
+             hands out queue depths and traffic volumes to anyone who asks.
+  the worker nothing addresses it, so there is nothing to route.
+
+The dashboard is under /dashboard on the same host, so it comes along with this rule. If you
+want it on a separate hostname or behind a VPN, add a second Ingress selecting the same
+Service - the application does not care which host it is reached on.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "hookline.fullname" . }}-api
+  labels:
+    {{- include "hookline.labels" . | nindent 4 }}
+  annotations:
+    {{/* Webhook payloads are capped at 256KB by the application, so the proxy needs to allow
+         at least that much or it rejects requests before Hookline can return a clean 422. */}}
+    nginx.ingress.kubernetes.io/proxy-body-size: 1m
+    {{- with .Values.api.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  ingressClassName: {{ .Values.api.ingress.className }}
+  {{- if .Values.api.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ .Values.api.ingress.host | quote }}
+      secretName: {{ .Values.api.ingress.tls.secretName }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.api.ingress.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "hookline.fullname" . }}-api
+                port:
+                  name: http
+{{- end }}

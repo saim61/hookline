@@ -1,0 +1,91 @@
+{{/*
+The worker is a separate Deployment because it scales on a different signal: how slow customer
+endpoints are, not how many requests arrive. A worker blocked on a dozen ten-second timeouts
+must not be able to add latency to an ingest call.
+
+There is no Service in front of it, because nothing addresses a worker. It finds its own work
+by polling Postgres with SKIP LOCKED, so adding replicas needs no configuration and no
+coordination between them.
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "hookline.fullname" . }}-worker
+  labels:
+    {{- include "hookline.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  {{- if not .Values.worker.autoscaling.enabled }}
+  replicas: {{ .Values.worker.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "hookline.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: worker
+  template:
+    metadata:
+      labels:
+        {{- include "hookline.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: worker
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{/* Long enough for the current batch to drain after SIGTERM. Too short and SIGKILL
+           arrives mid-batch, leaving rows in_flight until the reaper reclaims them - correct,
+           but slower than it needs to be on every rolling deploy. */}}
+      terminationGracePeriodSeconds: {{ .Values.worker.terminationGracePeriodSeconds }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: worker
+          image: {{ include "hookline.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          command: ["hookline-worker"]
+          ports:
+            - name: metrics
+              containerPort: 9100
+          env:
+            {{- include "hookline.secretEnv" . | nindent 12 }}
+          envFrom:
+            {{- include "hookline.envFrom" . | nindent 12 }}
+          {{/* The worker serves no application HTTP, so the metrics listener is the liveness
+               signal - it is bound exactly when the process is alive. Note the limit of that:
+               a worker wedged on something would keep answering here, which is why the real
+               "is delivery healthy" signal is the queue-age metric and not a probe. */}}
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          {{/* No readiness probe: nothing routes traffic here, so readiness has no meaning.
+               Adding one would only give Kubernetes a reason to call a working pod
+               unavailable. */}}
+          volumeMounts:
+            {{- include "hookline.tmpVolumeMount" . | nindent 12 }}
+          resources:
+            {{- toYaml .Values.worker.resources | nindent 12 }}
+      volumes:
+        {{- include "hookline.tmpVolume" . | nindent 8 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

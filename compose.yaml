@@ -1,3 +1,31 @@
+# The whole stack. `docker compose up -d` gives a working Hookline with nothing installed
+# locally except Docker.
+#
+# For day-to-day development, run only the infrastructure and keep the app on the host, where
+# reload works and a debugger can attach:
+#
+#     docker compose up -d db redis
+#     uv run fastapi dev src/hookline/main.py
+#     uv run hookline-worker
+
+x-app: &app
+  build:
+    context: .
+  image: hookline:local
+  environment: &app-env
+    HOOKLINE_DATABASE_URL: postgresql+asyncpg://hookline:hookline@db:5432/hookline
+    HOOKLINE_REDIS_URL: redis://redis:6379/0
+    HOOKLINE_DEBUG: "false"
+  depends_on:
+    db:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+    # Nothing starts until the schema is current. Without this the API would boot against a
+    # database missing the tables it is about to query.
+    migrate:
+      condition: service_completed_successfully
+
 services:
   db:
     image: postgres:17-alpine
@@ -19,9 +47,9 @@ services:
   redis:
     image: redis:8-alpine
     container_name: hookline-redis
-    # No persistence on purpose. Everything Redis holds here - rate limit buckets,
-    # circuit breaker counters, the subscriber cache - is derived state that rebuilds
-    # itself. Losing it costs one cache miss and a reset breaker, never data.
+    # No persistence on purpose. Everything Redis holds here - rate limit buckets, circuit
+    # breaker counters, the subscriber cache, dashboard sessions - is derived state that
+    # rebuilds itself. Losing it costs a cache miss and a re-login, never data.
     command: ["redis-server", "--save", "", "--appendonly", "no"]
     ports:
       - "6379:6379"
@@ -30,6 +58,47 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+
+  # A one-shot job, not an init step inside the API. Run once regardless of how many API
+  # replicas there are: concurrent `alembic upgrade` processes race on the version table, and
+  # Alembic is not the place to discover that.
+  migrate:
+    build:
+      context: .
+    image: hookline:local
+    container_name: hookline-migrate
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      <<: *app-env
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    <<: *app
+    container_name: hookline-api
+    ports:
+      - "8000:8000"
+
+  worker:
+    <<: *app
+    container_name: hookline-worker
+    command: ["hookline-worker"]
+    ports:
+      # Prometheus scrape port. The worker serves no other HTTP.
+      - "9100:9100"
+    # Long enough for the current batch to finish before SIGKILL, so a restart does not
+    # strand a batch in_flight for the reaper to clean up minutes later.
+    stop_grace_period: 30s
+    # The default healthcheck curls :8000, which the worker does not serve. Point it at the
+    # metrics listener instead, which is up exactly when the worker is.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9100/metrics"]
+      interval: 15s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
 
 volumes:
   pgdata:

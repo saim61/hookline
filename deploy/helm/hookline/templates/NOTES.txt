@@ -1,0 +1,61 @@
+Hookline {{ .Chart.AppVersion }} is installed as {{ .Release.Name }}.
+
+  API      {{ .Values.api.replicaCount }} replica(s), image {{ include "hookline.image" . }}
+  Worker   {{ .Values.worker.replicaCount }} replica(s)
+  Auth     {{ if .Values.config.authEnabled }}enabled{{ else }}DISABLED - every request has the admin scope{{ end }}
+  Breaker  {{ .Values.config.circuitBreakerBackend }}
+
+{{- if .Values.migrations.enabled }}
+
+The schema was migrated by a pre-upgrade hook Job before these pods started. What it did:
+
+  kubectl logs -n {{ .Release.Namespace }} job/{{ include "hookline.fullname" . }}-migrate
+{{- else }}
+
+WARNING: migrations.enabled is false, so no schema upgrade ran. The pods will start and fail
+readiness against a database that may be missing tables. Run it yourself:
+
+  kubectl run -n {{ .Release.Namespace }} migrate --rm -it --restart=Never \
+    --image={{ include "hookline.image" . }} -- alembic upgrade head
+{{- end }}
+
+Create the first API key. This has to happen against the database rather than over HTTP,
+because minting a key requires a key:
+
+  kubectl exec -n {{ .Release.Namespace }} -it \
+    deploy/{{ include "hookline.fullname" . }}-api -- \
+    hookline-admin create-key --name "bootstrap"
+
+{{ if .Values.api.ingress.enabled -}}
+The API is at http{{ if .Values.api.ingress.tls.enabled }}s{{ end }}://{{ .Values.api.ingress.host }}
+{{- if .Values.config.dashboardEnabled }}
+The dashboard is at http{{ if .Values.api.ingress.tls.enabled }}s{{ end }}://{{ .Values.api.ingress.host }}/dashboard
+{{- end }}
+{{- else -}}
+No ingress. To reach it locally:
+
+  kubectl port-forward -n {{ .Release.Namespace }} \
+    svc/{{ include "hookline.fullname" . }}-api {{ .Values.api.service.port }}:{{ .Values.api.service.port }}
+
+  curl localhost:{{ .Values.api.service.port }}/ready
+{{- if .Values.config.dashboardEnabled }}
+  open http://localhost:{{ .Values.api.service.port }}/dashboard
+{{- end }}
+{{- end }}
+
+Watch whether delivery is keeping up. This one number answers it - if it grows, add worker
+replicas; they coordinate through Postgres, so no configuration changes:
+
+  max(hookline_oldest_pending_delivery_age_seconds)
+
+{{- if not .Values.secrets.existingSecret }}
+
+NOTE: the database and Redis URLs came from Helm values, so they are stored in the release
+object and appear in whatever logged the install command. For anything real, create the Secret
+out of band and set secrets.existingSecret.
+{{- end }}
+{{- if not .Values.config.authEnabled }}
+
+DANGER: authEnabled is false. Every request to this deployment is treated as holding the admin
+scope, including reading customers' signing secrets. Only ever do this on a throwaway cluster.
+{{- end }}

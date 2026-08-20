@@ -1,0 +1,91 @@
+{{/*
+Schema upgrade, as a Helm hook that runs before the new pods roll out.
+
+Not an init container: init containers run once per pod, so three replicas would race three
+`alembic upgrade` processes on the version table. Not a step inside the app either - the app
+should not be able to migrate the database it is querying.
+
+pre-install and pre-upgrade, with `before-hook-creation` deletion: the previous Job is removed
+just before this one is created, rather than after it succeeds, so `kubectl logs` can still
+answer "what did that upgrade actually do" long after the deploy.
+
+The hook failing aborts the release, which is the point. Rolling out code that expects a column
+the database does not have is worse than not rolling out at all. Note that `/ready` would not
+save us here - it runs `select 1`, which succeeds perfectly well against an empty schema, so
+readiness cannot be relied on to hold traffic until the tables exist.
+
+**Why this Job does not use envFrom.** Helm creates *all* pre-install hooks before *any* normal
+manifest, so at hook time the ConfigMap and Secret in this same chart do not exist yet - the
+first attempt at this failed with `configmap "hookline-config" not found`. Hook-annotating them
+too would fix the ordering but make them hook-managed, which means `helm uninstall` leaves them
+orphaned. Instead the Job takes only what it actually needs: alembic reads one setting, the
+database URL, and every other setting has a working default. Nothing else here is duplicated.
+*/}}
+{{- if .Values.migrations.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "hookline.fullname" . }}-migrate
+  labels:
+    {{- include "hookline.labels" . | nindent 4 }}
+    app.kubernetes.io/component: migrate
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  backoffLimit: {{ .Values.migrations.backoffLimit }}
+  activeDeadlineSeconds: {{ .Values.migrations.activeDeadlineSeconds }}
+  template:
+    metadata:
+      labels:
+        {{- include "hookline.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: migrate
+    spec:
+      restartPolicy: Never
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: migrate
+          image: {{ include "hookline.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          command: ["alembic", "upgrade", "head"]
+          env:
+            {{- if .Values.secrets.existingSecret }}
+            {{/* Created out of band, so it already exists when this hook runs - and the
+                 credential stays out of the release object entirely. This is the path to use
+                 anywhere real. */}}
+            - name: HOOKLINE_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.existingSecret }}
+                  key: database-url
+            {{- else }}
+            {{/* Chart-managed: the value is inlined because the chart's own Secret does not
+                 exist yet at hook time. No additional exposure - a URL passed in Helm values
+                 is already stored in the release object - but it is one more reason to prefer
+                 existingSecret outside a demo. */}}
+            - name: HOOKLINE_DATABASE_URL
+              value: {{ .Values.secrets.databaseUrl | quote }}
+            {{- end }}
+          volumeMounts:
+            {{- include "hookline.tmpVolumeMount" . | nindent 12 }}
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+      volumes:
+        {{- include "hookline.tmpVolume" . | nindent 8 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

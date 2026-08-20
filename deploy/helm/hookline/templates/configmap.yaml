@@ -1,0 +1,46 @@
+{{/*
+Non-secret settings. Connection strings live in the Secret; everything here is safe in a
+`kubectl get configmap -o yaml`.
+
+Every value is quoted. Kubernetes requires ConfigMap data to be strings, and an unquoted
+`false` or `5` becomes a bool or an int and fails the manifest - the kind of error that only
+appears at apply time.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "hookline.fullname" . }}-config
+  labels:
+    {{- include "hookline.labels" . | nindent 4 }}
+data:
+  HOOKLINE_DEBUG: {{ .Values.config.logLevelDebug | quote }}
+  HOOKLINE_AUTH_ENABLED: {{ .Values.config.authEnabled | quote }}
+  HOOKLINE_DASHBOARD_ENABLED: {{ .Values.config.dashboardEnabled | quote }}
+  HOOKLINE_METRICS_ENABLED: {{ .Values.config.metricsEnabled | quote }}
+
+  HOOKLINE_MAX_DELIVERY_ATTEMPTS: {{ .Values.config.maxDeliveryAttempts | quote }}
+  HOOKLINE_DELIVERY_TIMEOUT_SECONDS: {{ .Values.config.deliveryTimeoutSeconds | quote }}
+
+  HOOKLINE_WORKER_POLL_INTERVAL_SECONDS: {{ .Values.config.workerPollIntervalSeconds | quote }}
+  HOOKLINE_WORKER_BATCH_SIZE: {{ .Values.config.workerBatchSize | quote }}
+  HOOKLINE_STALE_DELIVERY_TIMEOUT_SECONDS: {{ .Values.config.staleDeliveryTimeoutSeconds | quote }}
+
+  HOOKLINE_RETRY_BASE_DELAY_SECONDS: {{ .Values.config.retryBaseDelaySeconds | quote }}
+  HOOKLINE_RETRY_MAX_DELAY_SECONDS: {{ .Values.config.retryMaxDelaySeconds | quote }}
+
+  HOOKLINE_CIRCUIT_BREAKER_FAILURE_THRESHOLD: {{ .Values.config.circuitBreakerFailureThreshold | quote }}
+  HOOKLINE_CIRCUIT_BREAKER_COOLDOWN_SECONDS: {{ .Values.config.circuitBreakerCooldownSeconds | quote }}
+  HOOKLINE_CIRCUIT_BREAKER_BACKEND: {{ .Values.config.circuitBreakerBackend | quote }}
+
+  HOOKLINE_RATE_LIMIT_ENABLED: {{ .Values.config.rateLimitEnabled | quote }}
+  HOOKLINE_RATE_LIMIT_CAPACITY: {{ .Values.config.rateLimitCapacity | quote }}
+  HOOKLINE_RATE_LIMIT_REFILL_PER_SECOND: {{ .Values.config.rateLimitRefillPerSecond | quote }}
+
+  HOOKLINE_DELIVERY_RATE_LIMIT_ENABLED: {{ .Values.config.deliveryRateLimitEnabled | quote }}
+  HOOKLINE_DELIVERY_RATE_LIMIT_CAPACITY: {{ .Values.config.deliveryRateLimitCapacity | quote }}
+  HOOKLINE_DELIVERY_RATE_LIMIT_PER_SECOND: {{ .Values.config.deliveryRateLimitPerSecond | quote }}
+
+  HOOKLINE_SUBSCRIBER_CACHE_TTL_SECONDS: {{ .Values.config.subscriberCacheTtlSeconds | quote }}
+  {{- if .Values.config.otelEndpoint }}
+  HOOKLINE_OTEL_ENDPOINT: {{ .Values.config.otelEndpoint | quote }}
+  {{- end }}

@@ -1,0 +1,96 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "hookline.fullname" . }}-api
+  labels:
+    {{- include "hookline.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  {{- if not .Values.api.autoscaling.enabled }}
+  {{/* Omitted entirely when the HPA owns the replica count. Leaving it in means every
+       `helm upgrade` resets the deployment to the number in values.yaml and fights the
+       autoscaler back down. */}}
+  replicas: {{ .Values.api.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "hookline.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: api
+  template:
+    metadata:
+      labels:
+        {{- include "hookline.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: api
+      annotations:
+        {{/* Roll the pods when the ConfigMap changes. Kubernetes restarts nothing when a
+             ConfigMap is updated, and env vars are read once at startup, so without this a
+             config change appears to apply and quietly does nothing. */}}
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: api
+          image: {{ include "hookline.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            {{- include "hookline.secretEnv" . | nindent 12 }}
+          envFrom:
+            {{- include "hookline.envFrom" . | nindent 12 }}
+          {{/* Liveness never touches Postgres. A failing liveness probe restarts the pod, so
+               if it checked the database a brief blip would restart every replica at once and
+               turn a recoverable outage into a much worse one. */}}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          {{/* Readiness does check it: a pod that cannot reach Postgres should leave the load
+               balancer rather than be killed. Redis is reported there but never fatal. */}}
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          {{/* Until the startup probe succeeds the liveness probe is not evaluated at all, so
+               a slow first boot cannot get the pod killed on the way up. */}}
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 2
+            failureThreshold: 15
+          volumeMounts:
+            {{- include "hookline.tmpVolumeMount" . | nindent 12 }}
+          resources:
+            {{- toYaml .Values.api.resources | nindent 12 }}
+      volumes:
+        {{- include "hookline.tmpVolume" . | nindent 8 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

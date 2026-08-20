@@ -1,0 +1,82 @@
+name: Release
+
+# Tags only. A branch push should never produce a pushed image: the tag is the record of what
+# was released, and `latest` moving on every merge to main makes a rollback impossible to
+# describe.
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ${{ github.repository }}
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Required to push to GHCR with the automatic GITHUB_TOKEN, which avoids storing a
+      # registry credential in the repository at all.
+      packages: write
+      # For build provenance attestation below.
+      id-token: write
+      attestations: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=long
+          # `latest` only for a real release. A prerelease tag moving `latest` is how people
+          # end up running a release candidate in production without meaning to.
+          flavor: latest=auto
+
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          # amd64 and arm64: CI runners and most cloud nodes are amd64, Apple Silicon
+          # laptops are arm64, and one manifest covers both so `docker run` works everywhere.
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Signed statement of which workflow and which commit produced this digest, so a
+      # consumer can verify the image came from this repository rather than from someone with
+      # push access to the registry.
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Package the chart with the released version
+        # The chart is versioned with the app rather than independently, so a chart artifact
+        # and an image tag always refer to the same code.
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          helm package deploy/helm/hookline \
+            --version "$VERSION" --app-version "$VERSION" -d dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: helm-chart
+          path: dist/*.tgz

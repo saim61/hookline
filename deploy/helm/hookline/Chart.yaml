@@ -1,0 +1,21 @@
+apiVersion: v2
+name: hookline
+description: Reliable webhook delivery with retries, backoff, HMAC signing and a dead letter queue
+type: application
+
+# The chart's own version, bumped when the templates change.
+version: 0.1.0
+# The application version this chart defaults to. Used as the image tag unless
+# image.tag is set, so `--set image.tag=...` is how you deploy a specific build.
+appVersion: "0.1.0"
+
+keywords:
+  - webhooks
+  - delivery
+  - outbox
+
+# No dependencies declared on purpose. Bundling Postgres and Redis subcharts makes a chart
+# that is easy to demo and wrong to run: a database managed by the same release that manages
+# the application gets deleted with it. Point the chart at managed instances instead - the
+# Minikube instructions in the README install them as separate releases, which is the same
+# shape as production with a different address.
